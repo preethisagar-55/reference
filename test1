@@ -1,1 +1,281 @@
-hello world
+consolidated scan jenkins file concept
+----------------------------------------
+
+checkmarx - security tool -> detects vulnerabilities in source code (SAST).
+sonarqube - Code quality – detects bugs, code smells, maintainability issues, and some security flaws.
+
+scansRuns Checkmarx One SAST scan on the source code.
+
+Runs container image security scan (Sysdig).
+
+For release builds only, it consolidates scan results.
+
+fileCreate → generates a consolidated scan file (merging SAST + container scan results).
+
+fileUpload → uploads the consolidated file to a central location (artifact repo or dashboard).
+
+
+
+Checks out multiple repos.
+
+Runs Checkmarx One SAST scans.
+
+Runs container security scans.
+
+Consolidates results into files (for release builds).
+
+Uploads consolidated scan artifacts for governance/compliance.
+
+Handles errors and notifications gracefully.
+
+
+
+
+“Whether the Checkmarx scan stage runs or not is controlled by the cxScan flag inside the branch‑specific YAML file. In release.yaml it is set to true, so the pipeline shows a stage called Consolidated scans and triggers the Checkmarx‑Scan job. In develop.yaml it is set to false, so that stage is skipped and you don’t see it in the logs.”
+
+That’s the essence:
+
+Stage name = “Consolidated scans”
+
+Actual job = Checkmarx‑Scan
+
+Flag source = YAML (release.yaml vs develop.yaml)
+
+
+
+--->signum container sigin
+
+Signs the Docker image and verifies the signature.
+
+Ensures image integrity and authenticity before publishing.
+----------------------------------------------------------------
+This Jenkins pipeline uses shared libraries to centralize configuration and stage logic, loads branch-specific stage flags from YAML via global.getStages, and runs on Kubernetes pod templates with multiple tool containers (jnlp, maven, helm, occlient, signum). It checks out code, detects which microservices changed, and builds the project to produce artifact metadata like versionNumber. If enabled by the YAML (e.g., sonar: true), it performs SonarQube analysis in the maven container using a token and branch context; if cxScan is true (release branches), it triggers a downstream Checkmarx-Scan job inside a stage named “Consolidated scans.” For dockerBuild, it acquires a lock to avoid concurrent contention, determines the target Docker registry (release vs snapshot), then for each changed service in parallel it copies a common Dockerfile and Helm scaffolding, updates Chart.yaml, installs the build chart, and uses the occlient to run oc start-build with the service directory as context so OpenShift builds and pushes the image; afterward it signs and verifies the image with Signum. The build-publish-charts stage packages Helm charts for both core (helm/) and AWS (helm-aws/) paths, uploads them to Artifactory under the appropriate repository (release/snapshot, with aws subpath where needed), and records published chart versions. When deploy: true (e.g., develop), it runs two deployments via a shared deploy function—one to Dev and another to Dev-ETIN—passing identifiers and the built version. Finally, it sets the build status and always sends a Microsoft Teams notification, with milestones to gate progress and parallel failFast to stop quickly on errors.
+
+-------------------------------------------------------------------
+
+stage wise explanation:
+Stage‑wise Explanation
+1. Checkout
+Runs in the jnlp container.
+
+Checks out source code from SCM (Bitbucket).
+
+Captures commit ID (scmVars.GIT_COMMIT) for traceability.
+
+2. Getting Changed Services
+Still in jnlp.
+
+Uses regex to detect which microservices changed (core-* or infra-*).
+
+Stores the list in services for later build/deploy.
+
+Logs the services for debugging.
+
+3. Build Project
+Calls a shared library function buildProject.
+
+Produces artifact metadata: artifactName, versionNumber, etc.
+
+This version number is reused in later stages (charts, docker images, deployments).
+
+4. Consolidated Scans (Checkmarx)
+Conditional: runs only if globalStages.cxScan = true (e.g., release branch).
+
+Stage name: "Consolidated scans".
+
+Triggers a downstream Jenkins job: Scans/Checkmarx-Scan/....
+
+Passes versionNumber as parameter.
+
+Purpose: static security analysis.
+
+5. Sonar Scan
+Conditional: runs if globalStages.sonar = true.
+
+Runs in maven container.
+
+Uses SonarQube environment (SQ3) and Jenkins credentials for token.
+
+Executes Maven Sonar plugin:
+
+Code
+mvn sonar:sonar -Dsonar.host.url=... -Dsonar.branch.name=... -Dsonar.login=$token
+Purpose: code quality analysis.
+
+6. Docker Build
+Conditional: runs if globalStages.dockerBuild = true.
+
+Protected by lock('rcs-ci') to avoid concurrent builds.
+
+Stage name: "docker-build".
+
+For each changed service (in parallel):
+
+Copy common Dockerfile and Helm chart templates into service directory.
+
+Update Chart.yaml  with service name and version.
+
+Run Helm install of build chart.
+
+Use occlient to run oc start-build in OpenShift, building the Docker image from service directory.
+
+Verify build success.
+
+Sign and verify the image with Signum for integrity.
+
+Purpose: build and push Docker images into registry (release or snapshot).
+
+7. Build & Publish Charts
+Runs in helm container.
+
+Two directories processed:
+
+helm/ → core services.
+
+helm-aws/ → AWS services + prerequisites.
+
+For each service:
+
+Package Helm chart (enaHelm.packageChart).
+
+Fetch chart name and version.
+
+Upload .tgz chart file to Artifactory (release or snapshot repo).
+
+Record chart in publishedCharts.
+
+Runs builds in parallel with failFast.
+
+Purpose: publish Helm charts so they can be deployed.
+
+8. Deploy‑Dev
+Conditional: runs if globalStages.deploy = true (e.g., develop branch).
+
+Calls shared deploy function with config, version, identifiers.
+
+Deploys services into Dev environment using Helm charts.
+
+9. Deploy‑DevEtin
+Additional deployment stage.
+
+Same as above but with different trigger identifier (webhooktriggerdevetin).
+
+Deploys into Dev‑ETIN environment (integration testing cluster).
+
+10. Error Handling & Notifications
+Catch block: marks build as Failure if any stage errors.
+
+Finally block:
+
+If no result set, mark as SUCCESS.
+
+Always notify Microsoft Teams via webhook with build status.
+
+✅ End‑to‑End Flow
+Checkout → Detect Changed Services → Build Project → (Checkmarx Scan if release) → Sonar Scan → Docker Build → Publish Helm Charts → Deploy to Dev & DevEtin → Notify Teams
+-----------------------
+
+🔑 Additional Key Points
+Shared Libraries:
+The pipeline heavily relies on Jenkins shared libraries (common-lib, retirement-cicd-library). This makes the pipeline modular, reusable, and easier to maintain. Functions like global.getConfig, global.getStages, enaMaven.executeCmdLine, enaHelm.packageChart, and deploy all come from these libraries.
+
+Branch‑based Behavior:
+The pipeline dynamically changes which stages run depending on branch type (develop.yaml, release.yaml, etc.). For example, cxScan is false in develop but true in release, so Checkmarx runs only for release builds. This is a common CI/CD pattern to enforce stricter checks on release branches.
+
+Parallelization:
+Both Docker builds and Helm chart packaging run in parallel across services, with failFast = true. This speeds up builds and ensures that if one service fails, the pipeline stops quickly.
+
+Resource Isolation:
+Each stage runs inside a specific container (maven, helm, occlient, signum) defined in the Kubernetes pod template. This isolates tools, ensures consistent environments, and avoids dependency conflicts.
+
+Locks & Milestones:
+
+lock('rcs-ci') prevents multiple pipelines from building Docker images simultaneously, avoiding race conditions.
+
+milestone() ensures that older builds don’t overtake newer ones in multi‑branch pipelines.
+
+Security & Compliance:
+
+Secrets are injected via Jenkins credentials (withCredentials).
+
+Docker images are signed and verified with Signum before publishing.
+
+Scans (SonarQube, Checkmarx, Sysdig, SEI) enforce code quality and security compliance.
+
+Artifact Management:
+Helm charts and Docker images are uploaded to Artifactory (release or snapshot repos). This provides versioned, traceable artifacts for deployment.
+
+Deployment Strategy:
+Deployments are automated via Helm into multiple environments (Dev, Dev‑ETIN). The pipeline uses identifiers (projectIdentifier, pipelineIdentifier, triggerIdentifier) to track and trigger deployments consistently.
+
+Notifications:
+Build results are always sent to Microsoft Teams via webhook, ensuring visibility for the team.
+
+Error Handling:
+The pipeline uses try/catch/finally to mark builds as failed on errors, but still guarantees notifications are sent.
+
+---------------------------------------------------------------------------------------------------------------------
+
+This Jenkins pipeline is built with shared libraries to keep the logic modular and reusable. It starts by checking out code and detecting which microservices changed, then builds the project and determines versioning. Depending on branch type, it conditionally runs security scans like Checkmarx and quality analysis with SonarQube. It then builds Docker images in OpenShift, signs them for integrity, and packages Helm charts which are uploaded to Artifactory. Finally, it deploys services into Dev and Dev‑ETIN environments when enabled, and always sends build status notifications to Microsoft Teams. The pipeline uses Kubernetes pod templates for tool isolation, parallel execution for efficiency, and branch‑specific YAML configs to control which stages run, making it a robust CI/CD setup for microservices.”
+
+This is concise, covers all stages, and highlights best practices — perfect for interviews.
+
+-------------------------------------CD------------------------
+
+A dry run ensures manifests are valid, images are correct, and no surprises occur before actual deployment.
+
+It acts as a quality gate for production-ready code.
+
+This Harness CD template defines a complete deployment stage using Native Helm. When triggered, it first performs a Kubernetes dry run for release branches to validate manifests and extract container image references. A shell script then parses those manifests to collect the images and, if needed, rewrites them from a development registry to a release registry to ensure proper artifact promotion. Next, a container verification step group runs security or compliance checks on those images. Once validation passes, the HelmDeploy step applies the actual Helm release to the target environment and infrastructure, which are chosen dynamically based on pipeline variables. The template supports deploying multiple services in parallel, retries failed deployments up to three times, and automatically rolls back if errors persist. Delegate selection is also dynamic, routing work to the right Harness delegate depending on the environment (such as performance, qualification, or UAT). In short, this CD pipeline ensures safe, validated, and secure deployments by combining pre-deployment checks, image promotion, container verification, Helm-based rollout, and robust failure handling, with special safeguards applied to release branches.
+
+----------------------------------------------------------------------
+latest version retirement logic explanation
+
+Initialization
+
+Sets variables like project, branch, infra, trigger type, and credentials.
+
+Ensures jq is available for JSON parsing.
+
+Branch & Version Validation
+
+If branch is a release branch (release/YYYY.N.N):
+
+majorVersion must match the branch version.
+
+Repo = project-helm-release-local.
+
+If branch is develop/feature:
+
+majorVersion must be empty.
+
+Repo = project-helm-snapshot-local.
+
+Infra Validation
+
+Maps infra values to prod or nonprod.
+
+Errors out if infra is invalid.
+
+AQL Query Construction
+
+Manual trigger + version given → check if that exact artifact exists.
+
+Auto trigger + version given → find latest patch for that major version.
+
+No version given → fetch all artifacts and pick the latest.
+
+Fetch & Process Results
+
+Sends query to Artifactory API.
+
+Uses jq to parse results.
+
+Either confirms version exists or selects the latest one.
+
+Prints services included in that chart version.
+
+Error Handling
+
+If rules are violated (wrong version, invalid infra, missing artifact), script exits with a clear error message.
+------------------------------------------
