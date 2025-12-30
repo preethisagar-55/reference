@@ -279,3 +279,38 @@ Error Handling
 
 If rules are violated (wrong version, invalid infra, missing artifact), script exits with a clear error message.
 ------------------------------------------
+ssh key notes
+
+
+Generate Private Key  
+openssl genrsa -aes256 -out private.key  
+→ Enter and remember passphrase.
+
+Export Public Key  
+ssh-keygen -y -f private.key  
+→ Copy output (starts with ssh-rsa) to server.
+
+Server Setup
+
+Switch to target user: dzdo su - <user>
+
+Create .ssh directory: mkdir -p ~/.ssh
+
+Go to .ssh: cd ~/.ssh
+
+Append public key to authorized_keys file.
+
+Set permissions: chmod 600 authorized_keys.
+
+Test Authentication  
+ssh -v -i private.key <user>@<server>  
+→ Enter passphrase when prompted.
+→ Successful login shows $ prompt.
+
+Troubleshooting
+
+Use -v for verbose output.
+
+Check sshd_config for proper pubkey settings.
+
+-------------------------------------------------
