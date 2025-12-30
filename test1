@@ -313,4 +313,178 @@ Use -v for verbose output.
 
 Check sshd_config for proper pubkey settings.
 
--------------------------------------------------
+-------------------------------------------------notes------------------
+
+curl -u <+pipeline.variables.ARTIFACTORY_USERNAME>:<+pipeline.variables.ARTIFACTORY_PASSWORD> -XGET https://artifactory/rcs-helm-snapshot-local/core-annuities-service-2024.4.0-SNAPSHOT.tgz -T  core-annuities-service-2024.4.0-SNAPSHOT.tgz
+
+curl -u <+pipeline.variables.ARTIFACTORY_USERNAME>:<+pipeline.variables.ARTIFACTORY_PASSWORD> -XGET https://artifactory/rcs-helm-snapshot-local/core-annuities-service-2024.4.0-SNAPSHOT.tgz -o core-annuities-service-2024.4.0-SNAPSHOT.tgz
+-T → Upload (send local file → server)
+
+-o → Download (save server response → local file)
+capital O -> if you want curl to keep the original filename from the URL automatically.
+
+curl -u "{artifactory_username}:$artifactory_password" -O https://artifactory/rcore-maven-snapshot-local/sample/2024.2.0-SNAPSHOT/sample-core-2024.2.0-20240403.160130-1.tar.gz
+
+
+curl -x proxy.prod.local:8080 -u 'Svc-RetirementDevOps:<+secrets.getValue("org.rngartifactorysecret")>' \
+-kv "https://artifactory/artifactory/rcore-maven-snapshot-local/com/fis/wra/retirement/retirement-core-moddev/<+pipeline.variables.Artifact_Version>/$latest_file" \
+-o "$latest_file" -1
+
+tar -xvf core-annuities-service-2024.4.0-SNAPSHOT.tgz
+
+ Go to your target namespace and select User Management > RoleBindings
+Create a Binding
+Name: Any name you want, typically the service account name (in some form) and the role being granted
+Namespace: The target namespace
+Role name: Edit
+Subject: ServiceAccount
+Subject namespace: The namespace where the service account was created
+Subject name: retirement-devops-jenkins-cicd.
+
+-----------------------------------------------------------------------------------------------------
+export $NAMESPACE= "<+stage.variables.namespace>"
+POD_NAME=$(kubectl get pods -n retire-sandbox-dev -l app=infra-configuration-service  -o jsonpath="{.items[0].metadata.name}")
+POD_STATUS=$(kubectl get pods $POD_NAME -n retire-sandbox-dev -o jsonpath="{.status.phase}")
+check_pod_status(){
+    #pod_name=$1
+    #namespace=$2
+    status=$(kubectl get pods "$POD_NAME" -n "$NAMESPACE" --no-headers | awk '{print$3}')
+    if ["$POD_STATUS"=="Running"];then
+     echo "pod $POD_NAME is running."
+    else
+     echo "pod $POD_NAME is not yet running.waiting..."
+    fi
+}
+#while! check_pod_status
+#"$expected_pod" "$namespace";
+#do sleep 10
+
+#echo "pod $expected_pod is up and running.proceeding with further deployment"
+-------------------------------------------------------------------------harness delegate------------------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: harness-performance-account-token
+  namespace: retirement-perf
+  labels:
+    delegate: harness-performance-delegate
+type: Opaque
+data:
+  DELEGATE_TOKEN: "blablabla"
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: perf-delegate
+  namespace: retirement-perf
+  labels:
+    harness.io/name: perf-delegate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      harness.io/name: delegate
+  template:
+    metadata:
+      labels:
+        harness.io/name: delegate
+      annotations:
+        prometheus.io/path: /api/metrics
+        prometheus.io/port: '3460'
+        prometheus.io/scrape: 'true'
+    spec:
+      restartPolicy: Always
+      serviceAccountName: retirement-performance-sa
+      imagePullSecrets:
+        - name: rcs-artifactory
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 600
+      containers:
+        - name: delegate
+          image: 'rcs-docker-dev.docker/harness/delegate:24.04.82804'
+          imagePullPolicy: Always
+          resources:
+            limits:
+              cpu: '1'
+              memory: 2Gi
+            requests:
+              cpu: 500m
+              memory: 2Gi
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3460
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+            periodSeconds: 60
+            successThreshold: 1
+            failureThreshold: 5
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: 3460
+              scheme: HTTP
+            initialDelaySeconds: 30
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 15
+          env:
+            - name: JAVA_OPTS
+              value: '-Xms64M'
+            - name: ACCOUNT_ID
+              value: XzgUIuZXRMWymCzLKYZpCg
+            - name: MANAGER_HOST_AND_PORT
+              value: 'https://app.harness.io/gratis'
+            - name: DEPLOY_MODE
+              value: KUBERNETES
+            - name: DELEGATE_NAME
+              value: harness-performance-delegate
+            - name: DELEGATE_TYPE
+              value: KUBERNETES
+            - name: DELEGATE_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: NEXT_GEN
+              value: 'true'
+            - name: CLIENT_TOOLS_DOWNLOAD_DISABLED
+              value: 'true'
+            - name: LOG_STREAMING_SERVICE_URL
+              value: 'https://app.harness.io/gratis/log-service/'
+            - name: DYNAMIC_REQUEST_HANDLING
+              value: 'false'
+            - name: PROXY_HOST
+              value: proxy.prod.local
+            - name: PROXY_PORT
+              value: '8080'
+            - name: PROXY_MANAGER
+              value: 'true'
+            - name: NO_PROXY
+              value: prod.local
+            - name: HTTPS_PROXY
+              value: 'http://proxy.prod.local:8080'
+          envFrom:
+            - secretRef:
+                name: harness-performance-account-token
+          securityContext:
+            allowPrivilegeEscalation: false
+      serviceAccount: retirement-performance-sa
+      dnsPolicy: ClusterFirst
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+  revisionHistoryLimit: 10
+  progressDeadlineSeconds: 600
+
+
+
+
+
