@@ -1,0 +1,1540 @@
+---------------------------------consolidated scans--------------------------------------------------------
+@Library(['common-lib@3-stable','retirement-cicd-library@feature/cxone_sast']) _
+String branchName = env.BRANCH_NAME
+String versionNumber = params.versionNumber ?: ''
+//String msTeamsWebhookUrl = 'https://webhook.office.com/...'
+
+Map cicd = [
+  cluster: 'retirement-cicd',
+  namespace: 'retirement-cicd',
+  prefix: 'rcs'
+]
+Map globalConfig = global.getConfig(cicd.prefix)
+Map globalStages = global.getStages(hotfixPublish: params.'hotfix-publish')
+
+String label = "${cicd.prefix}-checkmarx-${UUID.randomUUID().toString()}"
+String repoName = 'retirement-connect-services'
+String checkmarx_scanId = null
+String cxone_scanId = null
+
+secrets.createDockerRegistrySecrets(
+  cluster: cicd.cluster,
+  namespace: cicd.namespace,
+  repoPrefix: cicd.prefix
+)
+
+// Jenkins workspace
+String workingdir = globalConfig.constant.workingDir
+
+Map images = [
+    jnlp:globalConfig.image.jnlp, jnlpMemLmt:'20Gi',
+    maven:globalConfig.image.maven, mavenMemLmt:'6Gi', mavenCpuLmt:'2000m', mavenCpuReq:'200m', mavenOpts:"-Duser.home=${workingdir}",
+]
+
+timestamps {
+  slaveTemplate = new PodTemplates(cicd.cluster, label, images, workingdir, this, false, [])
+  slaveTemplate.BuilderTemplate {
+    node(slaveTemplate.podlabel) {
+        try {
+          def config = [:]
+          String cxoneProjectType
+
+          stage('pipeline config') {
+            config = [
+              repos: [
+                'retirement-adminweb-database',
+                'retirement-service-api',
+                'retirement-service-components',
+                'retirement-connect-services',
+                'retirement-service-digital',
+                'retirement-service-dvw',
+                'retirement-service-ivr',
+                'retirement-digital-database',
+                'retirement-service-gds',
+              ],
+              git: [
+                url: "${globalConfig.url.prefix.bitbucket}/{repo}.git",
+                branch: branchName,
+                credentialid: globalConfig.credential.bitbucket,
+              ],
+            ]
+            cxoneScanInfo = [
+              project:'Retirement_APIs',
+              projectTags:'scid:10003468',
+              projectGroup:'CxOne_BS_Retirement_APIs_A10003468'
+            ]
+          }
+          
+          //Checkout 
+          stage('checkout'){
+            container('jnlp') {
+              dir('mysource') {
+                checkout(config)
+                sh "pwd"
+                sh "ls -ltr"
+              }
+            }
+          } // End stage checkout
+
+          //CxOne scan
+          stage('cxOne scan') {
+            cxoneProjectType = cxone.getProjectType(
+              branchName: branchName
+            )
+            lock("${cxoneScanInfo.project}_${cxoneProjectType}") {
+              container('jnlp'){
+                  if (branchName.contains("release")){
+                    if("${versionNumber}" == ''){
+                      def majorVersion = branchName.split('/')[1]
+                      println "Major Version: ${majorVersion}"
+                      versionNumber = getLatestArtifactVersion(cicd, 'admin-gateway-service', majorVersion)
+                    }
+                    println "Latest version number : ${versionNumber}"
+                    tags = "release:${versionNumber}"
+                  }else{
+                    tags = "${env.BUILD_ID}_${env.BRANCH_NAME}"
+                  }
+                cxone_scanId = cxone.scan(
+                  project: cxoneScanInfo.project,
+                  projectType: cxoneProjectType,
+                  sourcePath: 'mysource',
+                  projectTags: cxoneScanInfo.projectTags,
+                  tags: tags,
+                  projectGroup: cxoneScanInfo.projectGroup
+                )  
+              }
+            } // End lock
+          } // End stage CxOne scan
+
+          if (globalStages.sysdig) {
+            stage('Container Security Scan') {
+              container('jnlp') {
+                rcscontainerscanhelper.containerSecurityScan(
+                  cicd      : cicd,                 
+                  repos     : config.repos,         
+                  branchName: branchName,           
+                  cxone     : [
+                    project       : cxoneScanInfo.project,   
+                    credentialsId : 'cxonecreds',            
+                    url           : 'https://cxone.cloud',
+                  ],
+                  versionNumber : versionNumber, 
+                  sourceRoot: 'mysource'           
+                )
+               def sid = rcscontainerscanhelper.extractCxOneScanIdFromLog(100000)
+               echo "Extracted Container scan id = ${sid ?: 'NOT_FOUND'}"
+              }
+            }
+          }
+          
+          if (branchName.contains("release")){
+            stage('File create'){
+              consolidatedScan.fileCreate(
+                  CxSCAProject: "${cxoneScanInfo.project}",
+                  cxone_scanId: "${cxone_scanId}")
+            }
+
+            stage('File upload'){
+              consolidatedScan.fileUpload(globalConfig,versionNumber,"${cxoneScanInfo.project}")
+            }
+          }
+        } //try
+        
+       catch(e) {
+        currentBuild.result = 'Failure'
+        echo 'Build Failed'
+        throw e
+      } finally {
+        if (currentBuild.result == null) {
+          currentBuild.result = 'SUCCESS'
+        }
+       // enaNotifiers.notifyMicrosoftTeams(webhookUrls:msTeamsWebhookUrl, message: currentBuild.result, status:currentBuild.result)
+      }
+    } // end of node "rcs-ci"
+  } // end of BuilderTemplate
+} // end of timestamps
+
+void checkout(Map config) {
+  config.repos.each { repo ->
+    dir(repo) {
+      String branch = config.git.branch
+      String gitURL = config.git.url.replace('{repo}', repo)
+      String project = (gitURL =~ /.*\/scm\/(.*)\/.*/)[0][1]
+      (branch, buildOnly) = getRemoteBranch {
+          [
+            _branch = branch,
+            _repo = repo,
+            _project = project
+          ]
+        }
+      git branch: branch, changelog: false, poll: false, credentialsId: config.git.credentialid, url: gitURL
+    }
+  }
+}
+
+
+----------notes-----------
+📦 Setup: Defines cluster/namespace (retirement-cicd), loads global configs, sets up Docker registry secrets, and prepares pod templates with Maven/JNLP containers.
+
+🔧 Pipeline Config: Lists repos to checkout, sets Git details, and configures CxOne scan project info.
+
+📂 Checkout Stage: Clones all listed repositories from Bitbucket into the workspace.
+
+🔍 CxOne Scan: Runs a security scan using CxOne.
+
+If branch = release, it figures out the version number and tags accordingly.
+
+Otherwise, it tags with build ID + branch name.
+
+🛡️ Container Security Scan: If enabled, runs Sysdig-based container security checks and extracts scan IDs.
+
+📑 File Handling (release branches only): Creates and uploads consolidated scan files for tracking.
+
+✅ Error Handling: Marks build as failed if any stage throws an error, otherwise sets result to success.
+
+👉 In short: It checks out multiple repos, runs CxOne + container security scans, handles release versioning, and uploads scan results.
+
+
+
+----------------------------------------cron consolidatedscan------------------------------------------------
+@Library(['common-lib@3-stable','retirement-cicd-library@develop']) _
+Map cicd = [
+  cluster: 'retirement-cicd',
+  namespace: 'retirement-cicd',
+  prefix: 'rcs'
+]
+Map globalConfig = global.getConfig(cicd.prefix)
+Map globalStages = global.getStages(hotfixPublish: params.'hotfix-publish')
+
+String label = "${cicd.prefix}-checkmarx-${UUID.randomUUID().toString()}"
+String repoName = 'retirement-connect-services'
+
+properties([
+    pipelineTriggers([
+      cron('H 4 * * *')
+    ])
+])
+
+secrets.createDockerRegistrySecrets(
+  cluster: cicd.cluster,
+  namespace: cicd.namespace,
+  repoPrefix: cicd.prefix
+)
+
+// Jenkins workspace
+String workingdir = globalConfig.constant.workingDir
+
+Map images = [
+    jnlp:globalConfig.image.jnlp, jnlpMemLmt:'20Gi',
+    maven:globalConfig.image.maven, mavenMemLmt:'6Gi', mavenCpuLmt:'2000m', mavenCpuReq:'200m', mavenOpts:"-Duser.home=${workingdir}",
+]
+
+timestamps {
+  slaveTemplate = new PodTemplates(cicd.cluster, label, images, workingdir, this, false, [])
+  slaveTemplate.BuilderTemplate {
+    node(slaveTemplate.podlabel) {
+        try {
+          stage('Schedule') {
+            build (
+              wait: false,
+              job: "../../Checkmarx-Scan/retirement-connect-services/develop"
+            )
+          }
+        } //try
+        
+       catch(e) {
+        currentBuild.result = 'Failure'
+        echo 'Build Failed'
+        throw e
+      } finally {
+        if (currentBuild.result == null) {
+          currentBuild.result = 'SUCCESS'
+        }
+       // enaNotifiers.notifyMicrosoftTeams(webhookUrls:msTeamsWebhookUrl, message: currentBuild.result, status:currentBuild.result)
+      }
+    } // end of node "rcs-ci"
+  } // end of BuilderTemplate
+} // end of timestamps
+
+
+-------------------------
+notes:
+Setup: Loads libraries (common-lib, retirement-cicd-library), defines cluster/namespace (retirement-cicd), and sets up Docker registry secrets.
+
+Properties: Adds a cron trigger → H 4 * * * (runs once daily around 4 AM, with Jenkins spreading load using H).
+
+Workspace & Images: Configures working directory and container images (JNLP + Maven).
+
+Execution:
+
+Creates a pod template and runs inside it.
+
+Stage "Schedule": Triggers another Jenkins job (../../Checkmarx-Scan/retirement-connect-services/develop) asynchronously (wait: false).
+
+Error Handling: Marks build as FAILURE if something goes wrong, otherwise sets SUCCESS.
+
+⚡ In short
+This pipeline is a scheduled job (via cron) that automatically triggers the Checkmarx scan job for the retirement-connect-services repo on the develop branch every day at 4 AM.
+
+
+----------------------------------------------------------------------------ret-ci-------------------------
+
+@Library(['common-lib@3-stable', 'retirement-cicd-library@develop']) _
+String branchName = env.BRANCH_NAME
+String msTeamsWebhookUrl = 'https://fglobal.webhook.office.com/webhookb2/40c59466-aba5-49b3-a212-7487319fe319@e3ff91d8-34c8-4b15-a0b4-18910a6ac575/JenkinsCI/9e388b04d97c4e8ea2ba879ecf7035f4/d50eebfb-7b5a-41f2-bed7-dac7c8beb8ea'
+List services = []
+String versionNumber = ''
+Map publishedCharts = [:]
+Map scmVars = [:]
+String commitId
+String buildUrl = env.BUILD_URL
+// Declare parameters directly in the Jenkins file
+def projectIdentifier = 'retirementconnectservices'
+def pipelineIdentifier = 'rcs_core_adhoc'
+def triggerIdentifier = 'webhooktrigger'
+def triggerIdentifierDevEtin = 'webhooktriggerdevetin'
+def aws_prereq_service = 'rcs-aws-prerequisites'
+
+Map cicd = [
+  cluster: 'retirement-cicd',
+  namespace: 'retirement-cicd',
+  prefix: 'rcs'
+]
+
+Map globalConfig = global.getConfig(cicd.prefix)
+Map globalStages = global.getStages(hotfixPublish: params.'hotfix-publish')
+String label = "${cicd.prefix}-ci-${UUID.randomUUID().toString()}"
+
+properties([
+  parameters([
+   booleanParam(name: 'hotfix-publish', defaultValue: false, description: 'Hotfix publish release artifacts')
+  ])
+])
+
+
+secrets.createDockerRegistrySecrets(
+  cluster: cicd.cluster,
+  namespace: cicd.namespace,
+  repoPrefix: cicd.prefix
+)
+
+// Jenkins workspace
+String workingdir = globalConfig.constant.workingDir
+
+Map images = [
+  jnlp:globalConfig.image.jnlp,
+  maven:globalConfig.image.maven, mavenMemLmt:'6Gi', mavenCpuLmt:'2000m', mavenCpuReq:'200m', mavenOpts:"-Duser.home=${workingdir}",
+  occlient:globalConfig.image.occlient, occlientMemLmt:'3Gi', occlientCpuLmt:'1500m', occlientCpuReq:'150m',
+  helm:globalConfig.image.helm, helmMemLmt:'3Gi', helmCpuLmt:'500m', helmCpuReq:'50m',
+  signum:globalConfig.image.signum,
+  signumConfig: globalConfig.signum
+]
+
+timestamps {
+  slaveTemplate = new PodTemplates(cicd.cluster, label, images, workingdir, this, false, [])
+  slaveTemplate.BuilderTemplate {
+    node(slaveTemplate.podlabel) {
+      def buildStatus = 'SUCCESS'
+      echo "jenkins build url is : ${buildUrl}"
+      try {
+        stage('checkout'){
+          container('jnlp') {
+            milestone()
+            scmVars = checkout scm
+            commitId = scmVars.GIT_COMMIT
+            echo "Bitbucket Commit ID: ${commitId}"
+          }
+        } // End stage checkout
+
+        stage('getting-changed-services'){
+          container('jnlp') {
+            milestone()
+            // get the changed services if a release, hotfix or develop branch. 
+            (services) = getChangedServices{
+              [
+                _serviceNameRegex = '\\(core\\|infra\\)\\-\\.*\\-service',
+                _scmVars = scmVars
+              ]
+            }
+            enaLogger.debug(msg: "Runtime services: ${services}")
+          }
+        } // End stage getting-changed-services
+
+        (artifactName, versionNumber, queryVersion, versionParts) = buildProject {
+          [
+            _globalConfig = globalConfig,
+            _globalStages = globalStages
+          ]
+        }
+
+        //Scans
+        if (globalStages.cxScan){
+         stage('Consolidated scans') {
+            build (
+              wait: false,
+              job: "../../Scans/Checkmarx-Scan/retirement-connect-services/${branchName.replace('/','%2F')}",
+              parameters: [string(name: 'versionNumber', value: "${versionNumber}")]
+            )
+          }
+        }
+        
+        // Sonar Scan
+        if (globalStages.sonar) {
+          stage('sonar-scan'){
+            container('maven') {
+              withSonarQubeEnv('SQ3') {
+                withCredentials([string(credentialsId: globalConfig.credential.sonar, variable: 'token')]) {
+                  enaMaven.executeCmdLine(
+                    mvnExecPath: 'mvn',
+                    pomPath: globalConfig.constant.pom,
+                    mavenArgs: "sonar:sonar -Dsonar.host.url=${SONAR_HOST_URL} -Dsonar.branch.name=${branchName} -Dsonar.login=\$token -Dsonar.buildbreaker.skip=true"
+                  )
+                }
+              }
+            }
+          } // End stage sonar-scan
+        }
+
+        if (globalStages.dockerBuild) {
+          lock('rcs-ci') {
+            // docker build
+            stage ('docker-build'){
+              milestone()
+
+              String namespace = cicd.namespace
+
+              Map builds = [:]
+              String registry = globalStages.release ? globalConfig.repo.release.docker : globalConfig.repo.snapshot.docker
+              services.each { service -> 
+                builds += [
+                  (service.toString()) : {
+                    String release = "${service}-build"
+                    String chartPath = "./${service}/helm/${release}"
+                    
+                    Object mavenPom = readMavenPom (file: "./${service}/${globalConfig.constant.pom}")
+                    versionNumber = mavenPom?.version ?: mavenPom?.parent?.version
+
+                    // 1) Copy common Dockerfile to service directory
+                    // 2) Copy common build charts to service directory under helm sub-directory
+                    // 3) Rename build yaml file to match service name
+                    // 4) Update Chart.yaml appVersion value to match pom version
+                    // 5) Update Chart.yaml name value to match service name
+                    sh """
+                      cp Dockerfile FGLOBALROOTCA.crt ./${service}
+                      mkdir -p ${chartPath} && cp -R './helm/core-services-build/.' ${chartPath}
+                      mv ${chartPath}/templates/core-services-build.yaml ${chartPath}/templates/${release}.yaml
+                      sed -i "s/^name:.*\$/name: ${release}/" "${chartPath}"/Chart.yaml
+                    """
+
+                    container('helm') {
+                      withCredentials([string(credentialsId: 'cacert_password', variable: 'CACERT_PASSWORD')]) {
+                        helm.installBuildChart(
+                          release: release,
+                          chartPath: chartPath,
+                          registry: registry,
+                          service: service,
+                          namespace: namespace,
+                          versionNumber: versionNumber,
+                          flags: [
+                            '--set config.data.cacert_password=${CACERT_PASSWORD}'
+                          ],
+                          globalConfig: globalConfig,
+                          globalStages: globalStages
+                        )
+                      }
+                    }
+
+                    container('occlient'){
+                      // 'Start-build' of helm chart using the service directory for the context
+                      Map results = enaOpenshift.oc(
+                        cmd: 'start-build',
+                        args: [
+                          release,
+                          "--from-dir=./${service}",
+                          '--wait',
+                          '--follow'
+                        ]
+                      )
+                      println results
+                      if (results.exitCode != 0) {
+                        error "Docker Build failed: ${results}"
+                      }
+                    }
+                    
+                    echo "Docker image build completed successfully for ${service} with version ${versionNumber}"
+                    
+                    container('signum') {
+                      String imagePath = "${registry}/${service}:${versionNumber}"
+                      def signumConfig = globalConfig.signum
+                      
+                      imagesigning([
+                        action: 'both',  // Sign and verify
+                        registry: registry,
+                        artiCredsID: globalConfig.credential.artifactory,
+                        imageFullPath: imagePath,
+                        signKey: 'F - Internal'
+                      ])
+                    }
+                  } // End build closure
+                ]
+              } // End service iteration
+              builds.failFast = true
+              parallel builds
+            } // stage docker build ends here
+          } // End lock
+
+          stage('build-publish-charts') {
+            container('helm') {
+              dir('helm') {
+                Map builds = [:]
+                services.each { service ->
+                  builds += [
+                    (service.toString()) : {
+                      enaHelm.packageChart(
+                        path: service,
+                        flags: [
+                          "--version ${versionNumber}",
+                          "--app-version ${versionNumber}"
+                        ]
+                      )
+                      String chartName = enaHelm.fetchChartName(
+                        path: service
+                      )
+                      String chartFileName = "${chartName}-${versionNumber}.tgz"
+                      enaArtifactory.uploadArtifact(
+                        credentialsId: globalConfig.credential.artifactory,
+                        artifact: chartFileName,
+                        destinationPath: "${globalConfig.url.prefix.artifactory}/${globalStages.release ? globalConfig.repo.release.helm : globalConfig.repo.snapshot.helm}/${chartFileName}"
+                      )
+                      publishedCharts.put(chartName,versionNumber)
+                    }
+                  ]
+                }
+
+                builds.failFast = true
+                parallel builds
+              }
+              dir('helm-aws') {
+                Map builds = [:]
+                services.each { service ->
+                  builds += [
+                    (service.toString()) : {
+                      enaHelm.packageChart(
+                        path: service,
+                        flags: [
+                          "--version ${versionNumber}",
+                          "--app-version ${versionNumber}"
+                        ]
+                      )
+                      String chartName = enaHelm.fetchChartName(
+                        path: service
+                      )
+                      String chartFileName = "${chartName}-${versionNumber}.tgz"
+                      enaArtifactory.uploadArtifact(
+                        credentialsId: globalConfig.credential.artifactory,
+                        artifact: chartFileName,
+                        destinationPath: "${globalConfig.url.prefix.artifactory}/${globalStages.release ? globalConfig.repo.release.helm : globalConfig.repo.snapshot.helm}/aws/${chartFileName}"
+                      )
+                      publishedCharts.put(chartName,versionNumber)
+                    }
+                  ]                  
+                }
+                builds += [
+                    (aws_prereq_service.toString()) : {
+                      enaHelm.packageChart(
+                        path: aws_prereq_service,
+                        flags: []
+                      )
+                      String chartName = enaHelm.fetchChartName(
+                         path: aws_prereq_service
+                      )
+                      String chartVersion = enaHelm.fetchChartVersion(
+                         path: aws_prereq_service
+                      )
+                      String chartFileName = "${chartName}-${chartVersion}.tgz"                     
+                      
+                      enaArtifactory.uploadArtifact(
+                        credentialsId: globalConfig.credential.artifactory,
+                        artifact: chartFileName,
+                        destinationPath: "${globalConfig.url.prefix.artifactory}/${globalStages.release ? globalConfig.repo.release.helm : globalConfig.repo.snapshot.helm}/aws/${chartFileName}"
+                      )
+                      publishedCharts.put(chartName,versionNumber)
+                    }
+                  ]  
+
+                builds.failFast = true
+                parallel builds
+              }
+            }
+          } // End stage build-publish-charts
+        }
+
+       if (globalStages.deploy) {
+          stage('deploy-dev') {
+            deploy {
+              [
+                _globalConfig = globalConfig,
+                _globalStages = globalStages,
+                // Pass below parameters to the deploy script
+                _versionNumber = versionNumber,
+                _projectIdentifier = projectIdentifier,
+                _pipelineIdentifier = pipelineIdentifier,
+                _triggerIdentifier = triggerIdentifier
+              ]
+            }
+            // Additional Dev-ETIN deployment webhook trigger
+          stage('deploy-devetin') {
+            deploy {
+              [
+                 _globalConfig = globalConfig,
+                _globalStages = globalStages,
+                // Pass below parameters to the deploy script
+                _versionNumber = versionNumber,
+                _projectIdentifier = projectIdentifier,
+                _pipelineIdentifier = pipelineIdentifier,
+                _triggerIdentifier = triggerIdentifierDevEtin
+              ]
+            }
+          }
+        } 
+        } // End stage deploy
+      } catch (e) {
+        currentBuild.result = 'Failure'
+        echo 'Build Failed'
+        throw e
+      } finally {
+        if (currentBuild.result == null) {
+          currentBuild.result = 'SUCCESS'
+        }
+        enaNotifiers.notifyMicrosoftTeams(webhookUrls:msTeamsWebhookUrl, message: currentBuild.result, status:currentBuild.result)
+      }
+    } // End node
+  } // End timestamps
+}
+-----------------------------------------------------------------------helm---------------
+hlm consists of templaes --->deployment.yaml,config.yaml,secret.yaml,service.yaml,ingress.yaml,hpa.yaml
+
+
+In values-qa.yaml, there is no useLocal entry, so it also defaults to false.
+→ Same result: the RBAC objects won’t be created unless you explicitly set useLocal: true in values.yaml
+
+
+sample values.yaml--------------------
+
+useLocal: false
+
+replicaCount: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 60
+  cooldownPeriod: 300
+
+image:
+  name: infra-configuration-service
+  pullPolicy: Always
+  registry: rcs-docker-dev.docker.dev
+
+serviceAccount:
+  name: retirement-pod-owner
+
+config:
+  data:
+    SPRING_PROFILES_ACTIVE: native,kube,jdbc
+    SPRING_MAIL_HOST: mail.dev.local
+    SPRING_MAIL_PORT: 25
+    ###
+    RCS_FCM_PROXY_ENABLED: false
+    RCS_PROXY_HOST: proxy.prod.local
+    RCS_PROXY_PORT: 8080
+    ##
+    RCS_FCM_BASEURL: http://10.7.177.181
+    JAVA_OPTS: "-XX:InitialRAMPercentage=25.0 -XX:MaxRAMPercentage=70.0 -XX:+DisableExplicitGC -XX:+UseG1GC -XX:+UseStringDeduplication -XX:+HeapDumpOnOutOfMemoryError"
+    RCS_AW_IDP_BASEURL: https://infinity.dev.cloudservices.com/idp/
+    RCS_AW_IDP_PROXY_ENABLED: false
+    RCS_DIGI_IDP_BASEURL: https://infinity.dev.cloudservices.com/idp/
+    RCS_DIGI_IDP_DIH_BASEURL: https://ih-system.dev.local/xpressng/plainrest/idpclddev/idp/
+    RCS_DIGI_IDP_PROXY_ENABLED: false
+  fromSecret:
+    sftp-host:
+       RCS_SFTP_USER: sftp_user
+       RCS_SFTP_PASSPHRASE: sftp_passphrase
+  avrio:
+    idp:
+      restApiKey: DEV
+      idpDefaultProfile: default
+    proxy:
+       host:
+       port:
+    preEnrollment:
+       fileStoragePath: /pre-enrolment
+    oidp:
+       version: v1
+
+  configMap:
+    name: config-server
+  redis:
+    host: avrio-infra-service-redis-db
+    port: 6379
+    password: <+secrets.getValue("redispassworddev")>
+  gateway:
+    allowedOrigins:
+      - http://dev.local
+      - https://retirementwme.dev.local
+  springdoc:
+    server:
+      uri: https://core-gateway-service-retirement-dev.apps.useast-2-lev-1.mcp.dev.local
+      digital: https://digital-gateway-service-retirement-dev.apps.useast-2-lev-1.mcp.dev.local
+      admin: https://admin-gateway-service-retirement-dev.apps.useast-2-lev-1.mcp.dev.local
+      planonboarding: https://plan-onboarding-gateway-service-retirement-dev.apps.useast-2-lev-1.mcp.dev.local
+secret:
+  gds-database:
+    primary_pass:
+    primary_user:
+  partweb-database:
+    primary_pass:
+    primary_user:
+  new-admin-web-database:
+    primary_pass:
+    primary_user:
+  sftp-host:
+    sftp_user:
+    sftp_passphrase:
+  sftp-ppk:
+    service_account_key:
+
+service:
+  ports:
+    app:
+      port: 80
+      targetPort: 8889
+
+ingress:
+  enabled: false
+
+routes:
+  default:
+    enabled: true
+    host:
+    path: /
+
+probe:
+  enabled: true
+  timeoutSeconds: 5
+  scheme: HTTP
+  readiness:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    path: /actuator/health/readiness
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    path: /actuator/health/liveness
+  startup:
+    path: /actuator/health/readiness
+    initialDelaySeconds: 30
+    periodSeconds: 10
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 1024Mi
+  requests:
+    cpu: 50m
+    memory: 1024Mi
+--------------------------sample docker file---------
+FROM rcs-docker-dev.docker.dev/ibm-semeru-runtimes:open-21.0.8_9-jdk as builder
+ARG JAR_FILE=target/*.jar
+ARG CACERT_PWD
+COPY ${JAR_FILE} application.jar
+
+COPY ROOTCA.crt ${JAVA_HOME}/lib/security/
+
+RUN java -Djarmode=tools -jar application.jar extract --launcher && \
+    keytool -import -file ${JAVA_HOME}/lib/security/ROOTCA.crt -cacerts -storepass ${CACERT_PWD} -noprompt -alias rootca
+
+FROM rcs-docker-dev.docker.dev/ibm-semeru-runtimes:open-21.0.8_9-jdk
+ENV JAVA_OPTS=" \
+  -XX:InitialRAMPercentage=25.0 \
+  -XX:MaxRAMPercentage=75.0 \
+  -XX:+DisableExplicitGC \
+  -XX:+UseG1GC \
+  -XX:+UseStringDeduplication \
+  -XX:+HeapDumpOnOutOfMemoryError"
+  
+ENV JAVA_HOME=/opt/java/openjdk
+ENV PATH "${JAVA_HOME}/bin:${PATH}"
+
+COPY --from=builder application/ ./
+COPY --from=builder ${JAVA_HOME}/lib/security/ ${JAVA_HOME}/lib/security/
+
+RUN groupadd --system spring && useradd -g spring spring
+USER spring:spring
+
+ENTRYPOINT exec java ${JAVA_OPTS} org.springframework.boot.loader.launch.JarLauncher
+
+------------------------------sei.groovy    notes-------------------------------------------------
+
+
+void call(String versionNumber, String[] repositoryNames, Date start_time, Map cicd = [:], String location){
+  echo "Inside SEI"
+                withCredentials([usernamePassword(credentialsId: 'retirement-svc-acct', usernameVariable: 'USER_CREDENTIALS_USR', passwordVariable: 'USER_CREDENTIALS_PSW' )]) {
+                def apiUrl = 'https://app.harness.io/gratis/sei/api/v1/custom-cicd'
+                location = "${location}"
+                echo "location: ${location}"
+                def apiKey = 'Apikey eyJrZXkiOiJveDdoYkJ1cElvTCsmV0pFbmhDaVNhYWV6JkR0WldJcG51MnFoYzlBbTBzMzI4TUtNUCIsImlkIjoiMzU1NDE0MzgtODZjZi00NDliLThjNDUtYzg1NTllZDI1ZmNkIiwiY29tcGFueSI6ImZpc2dsb2JhbCJ9'
+                echo sh(script: 'env|sort', returnStdout: true)
+                def repoName = env.JOB_NAME
+                echo "repoName: ${repoName}"
+                pipeline = "${repoName}"
+                echo "pipeline: ${pipeline}"
+                wrap([$class: 'BuildUser']) {
+                user_id = ""
+                if (env.BUILD_USER ){
+                    user_id = "${BUILD_USER}"
+                }else {
+                    user_id = "Branch event"
+                }
+                echo "user_id: ${user_id}"
+                }
+                def getUrl = sh(script: "git config --get remote.origin.url",returnStdout:true).trim()
+                repo_url = "${getUrl}"
+                echo "repo_url: ${repo_url}"
+                result = "success"
+                echo "result: ${result}"
+                startTime = "${start_time}"
+                echo "startTime: ${startTime}"
+                endTime = new Date()
+                echo "endTime: ${endTime}"
+                def int duration = (endTime.getTime() - start_time.getTime())
+                def start_msec = start_time.getTime()
+                echo "${start_msec}"
+                echo "duration: ${duration}"
+                build_number = "${env.BUILD_NUMBER}"
+                echo "build_number: ${build_number}"
+                instance_guid = "d6961b19-fcbb-4f16-8c55-c4b33a010260"
+                instance_name = "ci-cd-instance"
+                echo "instance_name: ${instance_name}"
+                instance_url = "https://jenkins.fis.dev/"
+                echo "instance_url: ${instance_url}"
+                job_full_name = "${repoName}"
+                qualified_name = "${repoName}"
+                branch_name = "${env.BRANCH_NAME}"
+                module_name = ""
+                env.repo = "${repo_url.replace(".git","")}"
+                echo "repo: ${repo}"
+                def latestReleaseBranches = sh (script: "git for-each-ref --format='%(refname:short)' --sort='-committerdate' 'refs/remotes/**/release/*' | head -n 2", returnStdout: true).trim ()
+                def branches = latestReleaseBranches.split('\n')
+                def currentReleaseBranch = branches[0]
+                def previousReleaseBranch = branches[1]
+                echo "Current Release Branch: ${currentReleaseBranch}"
+                echo "Previous Release Branch: ${previousReleaseBranch}"
+                def diffCommits = sh(script: """
+                git log --pretty=format:'%H' ${previousReleaseBranch}..${currentReleaseBranch}
+                """, returnStdout: true).trim().split('\n')
+                echo "Commits between ${previousReleaseBranch} and ${currentReleaseBranch}:"
+                for (commit in diffCommits) {
+                  echo commit
+                }
+                def scm_commit_ids = ""
+                for (int i = 0; i < diffCommits.size(); i++) {
+                  scm_commit_ids += "\"${diffCommits[i]}\""
+                  if (i < diffCommits.size() - 1) {
+                    scm_commit_ids += ","   
+                  }
+                }
+                echo "Combined Commit IDs: ${scm_commit_ids}"
+                version = "${versionNumber}"
+                type = "container"
+                qualifier = "${versionNumber}"
+                
+                for (service in repositoryNames) {
+                name = "${service}"
+                def payload = '{ \"pipeline\": \"'+pipeline+'\", \"user_id\": \"'+user_id+'\", \"repo_url\": \"'+repo_url+'\", \"start_time\": \"'+start_msec+'\", \"result\": \"'+result+'\", \"duration\": \"'+duration+'\", \"build_number\": \"'+build_number+'\", \"instance_guid\": \"'+instance_guid+'\", \"instance_name\": \"'+instance_name+'\", \"instance_url\": \"'+instance_url+'\", \"job_full_name\": \"'+job_full_name+'\", \"qualified_name\": \"'+qualified_name+'\", \"branch_name\": \"'+branch_name+'\", \"module_name\": null, \"scm_commit_ids\": [ '+scm_commit_ids+' ], \"job_run_params\": [ { \"type\": \"StringParameterValue\", \"name\": \"'+version+'\", \"value\": 1 }, { \"type\": \"StringParameterValue\", \"name\": \"revision\", \"value\": 1 } ], \"ci\": true, \"cd\": false, \"artifacts\": [ { \"input\": false, \"output\": true, \"type\": \"'+type+'\", \"location\": \"'+location+'\", \"name\": \"'+name+'\", \"qualifier\": \"'+qualifier+'\" } ] }'
+                echo "payload: ${payload}"
+                sh "curl -X POST ${apiUrl} --header 'Accept: application/json, text/plain, */*' --header 'Referer:https://app.propelo.ai/' --header 'sec-ch-ua-mobile: ?0' --header 'authorization: ${apiKey}' --header 'Content-Type: application/json' --data '${payload}'"
+                echo 'Pushed execution detail to SEI...'
+                }
+            }
+}
+
+
+It’s a Jenkins shared library function that runs during a pipeline.
+
+Collects build info: job name, branch, repo URL, commits between release branches, build number, start/end time, duration, user who triggered.
+
+Builds a JSON payload with all this metadata plus artifact details.
+
+Uses curl -X POST to push that payload to Harness SEI API (https://app.harness.io/gratis/sei/api/v1/custom-cicd).
+
+Purpose: report CI/CD execution details (pipeline run, commits, artifacts) to Harness for analytics/insights.
+
+👉 In short: It gathers Jenkins build data and sends it to Harness SEI via a REST API call.
+
+---------------------------------------------------------------sonar.groovy-----------------------------------------
+/**
+ * <br>
+ * Copied from enaSonar, but modified to skip awaiting quality gate processing result, when qualityGateEnabled is false.
+ * <br>
+ * Runs SonarQube SonarScanner cli tool.
+ * <br>
+ * A quality gate response from the SonarQube server will be returned.
+ *
+ * @author Mark Perdue
+ * @author EnablementCIO@test.com
+ * @param serverName String name of sonarqube server name configured in jenkins configuration
+ * @param sonarScannerExec String containing the path to the sonar scanner executable
+ * @param url String containing the SonarQube host url
+ * @param credentialsId String containing the SonarQube host credential ID to upload scan.
+ *  Jenkins credential type is Secret text - a token
+ * @param overrideServerCreds Boolean used to override credentials for global sonar server configuration.
+ *  This will work only with sonar jenkins plugin > 2.9. Default value is set to false.
+ * @param projectKey String containing the SonarQube project key
+ * @param sources String containing the SonarQube sources
+ * @param retries (optional) Integer containing the number of retry attempts to retrieve quality gate where each retry
+ *  adds 1 min of wait time (defaults to 5)
+ * @param debug (optional) Boolean whether to enable debug output (defaults to false)
+ * @param addlArgs (optional) List containing additional args to be passed to sonar scanner (defaults to [])
+ * @return qualityGate object with status of sonar quality gate
+ * @exception Exception if sonarscan failed or if it timed out waiting for results
+ * @since 0.1.0
+ * @example <pre> {@code
+ * def results = sonar.scan(
+ *     serverName: 'myServer',
+ *     sonarScannerExec: 'SONAR_SCANNER/bin/sonar-scanner',
+ *     url: 'https://sonarqube.mobile.net',
+ *     credentialsId: 'SONAR_LOGIN',
+ *     overrideServerCreds: false,
+ *     projectKey: 'myProject',
+ *     sources: 'src',
+ *     retries: 5,
+ *     debug: true,
+ *     addlArgs: ['-Dsonar.sourceEncoding="UTF-8"']
+ * )
+ * }</pre>
+ */
+def scan(Map params = [:]) {
+    // enaTelemetry.emit(library: 'common-lib', file: 'sonar', method: 'scan')
+
+    enaLogger.debug(msg: 'Start of method sonar.scan()')
+    enaLogger.debug(msg: "Parameter serverName passed in value: ${params.serverName}")
+    enaLogger.debug(msg: "Parameter sonarScannerExec passed in value: ${params.sonarScannerExec}")
+    enaLogger.debug(msg: "Parameter url passed in value: ${params.url}")
+    enaLogger.debug(msg: "Parameter credentialsId passed in value: ${params.credentialsId}")
+    enaLogger.debug(msg: "Parameter projectKey passed in value: ${params.projectKey}")
+    enaLogger.debug(msg: "Parameter sources passed in value: ${params.sources}")
+    enaParams.required(name: 'serverName', value: params.serverName, class: String.class)
+    enaParams.required(name: 'sonarScannerExec', value: params.sonarScannerExec, class: String.class)
+    enaParams.required(name: 'url', value: params.url, class: String.class)
+    enaParams.required(name: 'credentialsId', value: params.credentialsId, class: String.class)
+    enaParams.required(name: 'projectKey', value: params.projectKey, class: String.class)
+    enaParams.required(name: 'sources', value: params.sources, class: String.class)
+
+    enaLogger.debug(msg: "Optional parameter retries passed in value: ${params.retries}")
+    enaLogger.debug(msg: "Optional parameter debug passed in value: ${params.debug}")
+    enaLogger.debug(msg: "Optional parameter addlArgs passed in value: ${params.addlArgs}")
+    enaLogger.debug(msg: "Optional parameter overrideServerCreds passed in value: ${params.overrideServerCreds}")
+    Boolean overrideServerCreds = enaParams.optional(
+        value: params.overrideServerCreds, class: Boolean.class, default: false)
+    int retries = enaParams.optional(value: params.retries, class: Integer.class, default: 5)
+    Boolean debug = enaParams.optional(value: params.debug, class: Boolean.class, default: false)
+	// Set qualityGateEnabled to false when you disable quality gate check in the project.
+	Boolean qualityGateEnabled = enaParams.optional(value: params.qualityGateEnabled, class: Boolean.class, default: true)
+    List addlArgs = enaParams.optional(value: params.addlArgs, class: List.class, default: [])
+
+    def runSonarScan = {
+        withCredentials([string(credentialsId: params.credentialsId, variable: 'sonarLogin')]) {
+            String cmd = "${params.sonarScannerExec} -Dsonar.host.url=${params.url}"
+            cmd += ' -Dsonar.login=${sonarLogin}'
+            cmd += " -Dsonar.projectKey=${params.projectKey} -Dsonar.sources=${params.sources}"
+
+            if (debug) {
+                enaLogger.log(msg: 'sonarScanner.groovy is in debug mode')
+                cmd += ' --debug -Dsonar.log.level=DEBUG -Dsonar.verbose=true'
+            }
+
+            if (addlArgs) {
+                cmd += ' ' + addlArgs.join(' ')
+            }
+			
+			if (!qualityGateEnabled) {                
+                cmd += ' -Dsonar.buildbreaker.skip=true'
+            }
+
+            int status = sh(
+                returnStatus: true,
+                script: cmd
+            )
+            if (status != 0) {
+                enaLogger.debug(msg: 'End of method sonar.scan()')
+                throw new Exception("Sonar scanner failed with ${status}")
+            }
+        }
+    }
+
+    if (overrideServerCreds) {
+        // withSonarQubeEnv is required, so SonarQube taskId is correctly attached to the pipeline context
+        withSonarQubeEnv(credentialsId: params.credentialsId, installationName: params.serverName) {
+            runSonarScan()
+        }
+    } else {
+        // withSonarQubeEnv is required, so SonarQube taskId is correctly attached to the pipeline context
+        withSonarQubeEnv(params.serverName) {
+            runSonarScan()
+        }
+    }	
+	
+	if (qualityGateEnabled) {
+
+		// Placeholder object for Sonar plugin is neccessary for case where the for-loop exceeds the retry count and needs
+		// to return an object as per the method signature
+		def result = [status: 'UNKNOWN']
+		boolean processingFinished = false
+	
+		for (int i = 0; i < retries && processingFinished == false; i++) {
+			try {
+				timeout(1) {
+					// Reuse taskId previously collected by withSonarQubeEnv
+					result = waitForQualityGate()
+	
+					// This will be triggered when the quality gate processing above has completed which will break the loop
+					processingFinished = true
+				}
+			} catch (err) {
+				enaLogger.log(msg: "Sonar server is still processing the results. Up to ${retries} retries will occur.")
+			}
+		}
+	
+		// Throw error to match defined behavior of a timeout throwing an exception
+		if (processingFinished == false) {
+			throw new Exception('Sonar scanner processing did not complete within the defined time window')
+		}
+	
+		enaLogger.debug(msg: 'End of method sonar.scan()')
+		return result
+	}
+	
+}
+
+/**
+ * Retrieves the number of vulnerabilities of a given severity from a SonarQube server.
+ *
+ * @author EnablementCIO@global.com
+ * @param url String containing the SonarQube host url
+ * @param project String containing the SonarQube project key
+ * @param severity String containing the severity level - one of ['minor','major','critical','blocker']
+ * @param credentialsId String containing the SonarQube login credentials id.
+ * Jenkins credential type is Secret text - a token
+ * @param branch (optional) String containing the branch name, defaults to null
+ * @return Integer containing the number of vulnerabilities found of the given severity
+ * @since 0.1.0
+ * @example <pre> {@code
+ * Integer results = sonar.getVulnerabilities(
+ *     url: 'https://sonarqube.mobile.net',
+ *     project: 'myProject',
+ *     severity: 'minor',
+ *     credentialsId: 'credentialsId'
+ * )
+ * }</pre>
+ */
+Integer getVulnerabilities(Map params = [:]) {
+    // enaTelemetry.emit(library: 'common-lib', file: 'sonar', method: 'getVulnerabilities')
+
+    enaLogger.debug(msg: 'Start of method sonar.getVulnerabilities()')
+    enaLogger.debug(msg: "Parameter url passed in value: ${params.url}")
+    enaLogger.debug(msg: "Parameter project passed in value: ${params.project}")
+    enaLogger.debug(msg: "Parameter severity passed in value: ${params.severity}")
+    enaLogger.debug(msg: "Parameter credentialsId passed in value: ${params.credentialsId}")
+    enaLogger.debug(msg: "Optional parameter branch passed in value: ${params.branch}")
+    enaParams.required(name: 'url', value: params.url, class: String.class)
+    enaParams.required(name: 'project', value: params.project, class: String.class)
+    enaParams.required(name: 'severity', value: params.severity, class: String.class)
+    enaParams.required(name: 'credentialsId', value: params.credentialsId, class: String.class)
+    String branch = enaParams.optional(value: params.branch, default: null, class: String.class)
+
+    String apiPath = 'api/issues/search'
+    // Create URL parameters to search for vulnerabilities
+    String urlParams = "componentKeys=${params.project}&severities=${params.severity.toUpperCase()}"
+    urlParams += '&resolved=false&types=VULNERABILITY'
+    if (null != branch)
+        urlParams += "&branch=${branch}"
+    // Create the full URL string
+    String urlString = "${params.url}/${apiPath}?${urlParams}"
+    def data = getMetrics(
+        urlString: urlString,
+        credentialsId: params.credentialsId
+    )
+    int result = data['total']
+    enaLogger.debug(msg: "Value being returned: ${result}")
+    enaLogger.debug(msg: 'End of method sonar.getVulnerabilities()')
+    return result
+}
+
+/**
+ * Retrieves a measure of a metric for a project from a SonarQube server.
+ * <br>
+ * If there is any data missing in the response the metric is determined to not have been collected by sonar and
+ * 0 will be returned.
+ *
+ * @author EnablementCIO@global.com
+ * @param url String containing the SonarQube host url
+ * @param project String containing the SonarQube project key
+ * @param metric String containing the sonar metric key e.g test_failures, skipped_tests
+ * @param credentialsId String containing the SonarQube login credentials id.
+ * Jenkins credential type is Secret text - a token
+ * @param branch (optional) String containing the branch name, defaults to null
+ * @return String containing the sonar measure for a metric
+ * @since 0.1.0
+ * @example <pre> {@code
+ * String results = sonar.getMeasures(
+ *     url: 'https://sonarqube.mobile.net',
+ *     project: 'myProject',
+ *     metric: 'skipped_tests',
+ *     credentialsId: 'credentialsId'
+ * )
+ * }</pre>
+ */
+String getMeasures(Map params = [:]) {
+    // enaTelemetry.emit(library: 'common-lib', file: 'sonar', method: 'getMeasures')
+
+    enaLogger.debug(msg: 'Start of method sonar.getMeasures()')
+    enaLogger.debug(msg: "Parameter url passed in value: ${params.url}")
+    enaLogger.debug(msg: "Parameter project passed in value: ${params.project}")
+    enaLogger.debug(msg: "Parameter metric passed in value: ${params.metric}")
+    enaLogger.debug(msg: "Parameter credentialsId passed in value: ${params.credentialsId}")
+    enaLogger.debug(msg: "Optional parameter branch passed in value: ${params.branch}")
+    enaParams.required(name: 'url', value: params.url, class: String.class)
+    enaParams.required(name: 'project', value: params.project, class: String.class)
+    enaParams.required(name: 'metric', value: params.metric, class: String.class)
+    enaParams.required(name: 'credentialsId', value: params.credentialsId, class: String.class)
+    String branch = enaParams.optional(value: params.branch, default: null, class: String.class)
+
+    String urlString = "${params.url}/api/measures/component?component=${params.project}&metricKeys=${params.metric}"
+    if (null != branch)
+        urlString += "&branch=${branch}"
+
+    def data = getMetrics(
+        urlString: urlString,
+        credentialsId: params.credentialsId
+    )
+    String result = data?.component?.measures?.getAt(0)?.value ?: '0'
+    //String result = data?.measures?.getAt(0)?.value ?: '0'
+    enaLogger.debug(msg: "Value being returned: ${result}")
+    enaLogger.debug(msg: 'End of method sonar.getMeasures()')
+    return result
+}
+
+/**
+ * Retrieves metrics for a project from a SonarQube server.
+ * <br>
+ * The data returned from the Sonar api will be parsed as json and returned.
+ *
+ * @author EnablementCIO@global.com
+ * @param urlString String containing the SonarQube url with full query string
+ * @param credentialsId String containing the SonarQube login crendentials id.
+ * Jenkins credential type is Secret text - a token
+ * @return Map containing the sonar api response for the GET request
+ * @since 0.1.0
+ * @example <pre> {@code
+ * Map results = sonar.getMetrics(
+ *     urlString: 'https://sonarqube.mobile.net/api/measures/search?projectKeys=my-project',
+ *     credentialsId: 'credentialsId'
+ * )
+ * }</pre>
+ */
+Map getMetrics(Map params = [:]) {
+    // enaTelemetry.emit(library: 'common-lib', file: 'sonar', method: 'getMetrics')
+
+    enaLogger.debug(msg: 'Start of method sonar.getMetrics()')
+    enaLogger.debug(msg: "Parameter urlString passed in value: ${params.urlString}")
+    enaLogger.debug(msg: "Parameter credentialsId passed in value: ${params.credentialsId}")
+    enaParams.required(name: 'urlString', value: params.urlString, class: String.class)
+    enaParams.required(name: 'credentialsId', value: params.credentialsId, class: String.class)
+
+    String authString = ''
+    // Need to get sonar credentials to configure client
+    withCredentials([string(credentialsId: params.credentialsId, variable: 'sonarLoginToken')]) {
+        authString = "${sonarLoginToken}:".getBytes().encodeBase64().toString()
+    }
+    Map reqProps = [Accept: 'Application.json', Authorization: "Basic ${authString}"]
+
+    def response
+
+    try {
+        response = readJSON(text: params.urlString.toURL().getText(requestProperties: reqProps))
+        enaLogger.debug(msg: "Value being returned: ${response}")
+    } catch (err) {
+        String message = "Failed while getting metrics for the project from the sonarqube server: ${params.urlString}"
+        enaLogger.log(msg: message, err: err)
+        throw new Exception(message, err)
+    } finally {
+        enaLogger.debug(msg: 'End of method sonar.getMetrics()')
+    }
+
+    return response
+}
+
+/**
+ * Retrieves SonarQube server version.
+ *
+ * @author EnablementCIO@global.com
+ * @param url String containing the SonarQube host url
+ * @return String containing the sonarqube server version
+ * @exception an exception is thrown if there was an error while executing curl or unable to retrieve server version
+ * @since 0.1.0
+ * @example <pre> {@code
+ * String result = sonar.serverVersion(
+ *     url: 'https://sonarqube.mobile.net'
+ * )
+ * }</pre>
+ */
+String serverVersion(Map params = [:]) {
+    // enaTelemetry.emit(library: 'common-lib', file: 'sonar', method: 'serverVersion')
+
+    enaLogger.debug(msg: 'Start of method sonar.serverVersion()')
+    enaLogger.debug(msg: "Parameter url passed in value: ${params.url}")
+    enaParams.required(name: 'url', value: params.url, class: String.class)
+    try {
+        String response = sh(returnStdout: true,
+            script: """
+                curl -s -X GET ${params.url}/api/server/version
+            """
+        ).trim()
+        if (response.isEmpty()) {
+            throw new Exception(response)
+        }
+        return response
+    } catch (err) {
+        String message = 'Failed to get sonarqube server version'
+        enaLogger.log(msg: message, err: err)
+        throw new Exception(message, err)
+    } finally {
+        enaLogger.debug(msg: 'End of method sonar.serverVersion()')
+    }
+}
+------------------------------------------------deploy.groovy  notes--------------------------------------------------------------------------
+
+#!/usr/bin/groovy
+
+def call(Closure body) {
+  Map config = [:]
+  scmVars = checkout scm
+  body.resolveStrategy = Closure.DELEGATE_FIRST
+  body.delegate = config
+  body()
+  Map globalConfig = config._globalConfig
+  Map globalStages = config._globalStages
+  String versionNumber = config._versionNumber
+  String projectIdentifier = config._projectIdentifier
+  String pipelineIdentifier = config._pipelineIdentifier
+  String triggerIdentifier = config._triggerIdentifier
+  def accountIdentifier = globalConfig.harness.accountIdentifier
+  def orgIdentifier = globalConfig.harness.orgIdentifier
+
+  // Construct the URL
+  def url = "https://app.harness.io/gateway/pipeline/api/webhook/custom/v2?accountIdentifier=${accountIdentifier}&orgIdentifier=${orgIdentifier}&projectIdentifier=${projectIdentifier}&pipelineIdentifier=${pipelineIdentifier}&triggerIdentifier=${triggerIdentifier}"
+  println "Constructed URL: ${url}"
+  def data = """{"jenkinsurl":"${env.BUILD_URL}", "bbcommit":"${scmVars?.GIT_COMMIT}", "chartVersion": "${versionNumber}"}"""
+  
+  container('jnlp') {
+    try {
+      withCredentials([string(credentialsId: 'harness-jenkins-token', variable: 'secret')]) {
+        sh """
+          RESPONSE=\$(curl -X POST -H 'content-type: application/json' --url '$url' -d '$data')
+          apiUrl=\$(echo \$RESPONSE | grep -o '"apiUrl":"[^"]*' | sed 's/"apiUrl":"//')
+          iteration=0
+          max_iterations=4
+          interval=10
+          while [ \$iteration -lt \$max_iterations ]; do
+              echo "Getting pipeline execution url"
+              getResponse=\$(curl -s -X GET --url "\$apiUrl" -H 'x-api-key: $secret')
+              execution_url=\$(echo \$getResponse | grep -o '"executionUrl":"[^"]*"' | sed -E 's/"executionUrl":"([^"]*)".*/\\1/' | sed 's/%22%7D.*//')
+              echo "Extracted execution_url: \$execution_url"
+              iteration=\$((iteration + 1))
+              echo "Waiting for 5 seconds..."
+              sleep \$interval
+          done
+          if [ -z "\$execution_url" ]; then
+             echo "Error: execution_url is empty"
+          fi
+          echo \$execution_url
+        """
+      }
+    } catch (error) {
+      echo "Error in Deploy stage: $error"
+      throw error
+    }
+  }
+}
+----------------------------------------------------------------------------------------sysdig.groovy notes-------------------------------
+#!/usr/bin/groovy
+
+def call(Closure body) {
+  Map config = [:]
+  body.resolveStrategy = Closure.DELEGATE_FIRST
+  body.delegate = config
+  body()
+  Map globalConfig = config._globalConfig
+  String imageTag = config._imageTag
+  String sysdigApiUrl = globalConfig.url.prefix.sysdig
+  
+  // Construct the URL
+  container('jnlp') {
+    try {
+      withCredentials([string(credentialsId: globalConfig.credential.sysdig, variable: 'SYSDIG_API_TOKEN'), usernamePassword(credentialsId: globalConfig.credential.artifactory, passwordVariable: 'DOCKER_REGISTRY_PASSWORD', usernameVariable: 'DOCKER_REGISTRY_USER')]) {        
+        sh """
+          if [ ! -e "sysdig-cli-scanner" ]; then
+            VERSION=\$(curl -L -s https://download.sysdig.com/scanning/sysdig-cli-scanner/latest_version.txt)
+            curl -LO "https://download.sysdig.com/scanning/bin/sysdig-cli-scanner/\${VERSION}/linux/amd64/sysdig-cli-scanner"
+          else
+            echo "sysdig-cli-scanner present no need to download."
+          fi
+          chmod +x ./sysdig-cli-scanner
+          export REGISTRY_USER="\$DOCKER_REGISTRY_USER"
+          export REGISTRY_PASSWORD="\$DOCKER_REGISTRY_PASSWORD"
+          export SECURE_API_TOKEN="\$SYSDIG_API_TOKEN"
+          ./sysdig-cli-scanner --apiurl="${sysdigApiUrl}" "${imageTag}"
+        """
+      }
+    } catch (error) {
+        enaLogger.log(msg: "Sysdig failed: ", err: error)
+      }
+  }
+}
+-----------------------------------------------------------------------------checkmarx.groocy notes----------------------------------------------
+/**
+ * Upload and scan application source code for vulnerabilities with Checkmarx SAST
+ *
+ * @author RetirementDevOps@company.com
+ * @param teamName (Required) the team associated with the Checkmarx project.
+ * @param project (Required) value for the CheckMarx project name when combined with projectType
+ * @param projectType (Required) the type of branch associated with the code to be scanned (i.e. dev/prod/feature)
+ * @param credentialsId (Optional) Jenkins credential for CheckMarx API authentication. Defaults to 'checkmarx_credentials'
+ * @param sourcePath (Optional) directory relative to the current directory which will be uploaded to CheckMarx. Defaults to 'source'
+ * @param checkmarxURL (Optional) base URL for CheckMarx. Defaults to https://checkmarx.net
+ * @param excludePattern (Optional) a comma-separated list of patterns for the files and folders which will be excluded for scanning
+ * @example <pre> {@code
+ * checkmarx.scan(
+ *   teamName: 'CxServer/SP/Company/BankingSolutions/Omni Tech/Retirement Next Gen',
+ *   project: 'Retirement_Next_Gen',
+ *   projectType: 'feature'
+ * )
+ * }</pre>
+ */
+String scan(Map params = [:]) {
+  enaLogger.debug(msg: "Parameter teamName passed in value: ${params.teamName}")
+  String teamName = enaParams.required(name: 'teamName', value: params.teamName, class: String.class)
+
+  enaLogger.debug(msg: "Parameter project passed in value: ${params.project}")
+  String project = enaParams.required(name: 'project', value: params.project, class: String.class)
+
+  enaLogger.debug(msg: "Parameter projectType passed in value: ${params.projectType}")
+  String projectType = enaParams.required(name: 'projectType', value: params.projectType, class: String.class)
+
+  String projectName = "${teamName}/${project}_${projectType}"
+  enaLogger.debug(msg: "Project Name: ${projectName}")
+
+  enaLogger.debug(msg: "Parameter credentialsId passed in value: ${params.credentialsId}")
+  String credentialsId = enaParams.optional(value: params.credentialsId, class: String.class, default: 'checkmarx_credentials')
+
+  enaLogger.debug(msg: "Parameter sourcePath passed in value: ${params.sourcePath}")
+  String sourcePath = enaParams.optional(value: params.sourcePath, class: String.class, default: 'source')
+
+  enaLogger.debug(msg: "Parameter checkmarxURL passed in value: ${params.checkmarxURL}")
+  String checkmarxURL = enaParams.optional(value: params.checkmarxURL, class: String.class, default: 'https://checkmarx.net')
+
+  enaLogger.debug(msg: "Parameter excludePattern passed in value: ${params.excludePattern}")
+  String excludePattern = enaParams.optional(value: params.excludePattern, class: String.class, default: '')
+  String exclusionArgument = excludePattern ? "-includeexcludepattern ${excludePattern}" : ''
+  enaLogger.debug(msg: "exclusionArgument: ${exclusionArgument}")
+
+  dir(downloadCLI()) {
+    withCredentials([usernamePassword(credentialsId: credentialsId, passwordVariable: 'pass', usernameVariable: 'user')]) {
+      def checkmarx_scanOutput = sh(script: """
+        export JAVA_TOOL_OPTIONS="-Dhttp.proxyHost=proxy.dev.local -Dhttp.proxyPort=8080 -Dhttp.nonProxyHosts=\\"10.45.0.1|*.dev.local|*.prod.local|*.cluster.local\\" -Dhttps.proxyHost=proxy.dev.local -Dhttps.proxyPort=8080 -Dhttps.nonProxyHosts=\\"10.45.0.1|*.dev.local|*.prod.local|*.cluster.local\\""
+        ./runCxConsole.sh scan \
+        -v \
+        -Projectname "${projectName}" \
+        -locationtype folder \
+        -locationpath "../${sourcePath}" \
+        -cxuser ${user} \
+        -cxpassword ${pass} \
+        -cxserver ${checkmarxURL} \
+        ${exclusionArgument}
+      """, returnStdout: true)
+        def checkmarx_scanId
+        def scanIdMatcher = (checkmarx_scanOutput =~ /Scan ID is (\d+)/)
+          if (scanIdMatcher) {
+              checkmarx_scanId = scanIdMatcher[0][1]
+              echo "Extracted Checkmarx Scan ID: ${checkmarx_scanId}"
+          }
+        return checkmarx_scanId;
+    }
+  }
+}
+
+/**
+ * Download and Extract CheckMarx CLI Plugin Zip file
+ *
+ * @author RetirementDevOps@company.com
+ * @param cliURL (Optional) url to download the CheckMarx CLI Plugin.  Defaults to https://download.checkmarx.com/9.5.0/Plugins/CxConsolePlugin-1.1.38.zip
+ * @param destinationDirectory (Optional) the location where the CLI Plugin will be extracted to.  Defaults to CheckMarxPlugin
+ * @returns destination directory where zip file is extracted to
+ * @example <pre> {@code
+ *   checkmarx.downloadCLI()
+ * }</pre>
+ */
+String downloadCLI(Map params = [:]) {
+  enaLogger.debug(msg: "Parameter cliURL passed in value: ${params.cliURL}")
+  String cliURL = enaParams.optional(value: params.cliURL, class: String.class, default: 'https://download.checkmarx.com/9.5.0/Plugins/CxConsolePlugin-1.1.38.zip')
+
+  enaLogger.debug(msg: "Parameter destinationDirectory passed in value: ${params.destinationDirectory}")
+  String destinationDirectory = enaParams.optional(value: params.destinationDirectory, class: String.class, default: 'CheckMarxPlugin')
+
+  String zipFileName = 'CheckMarxPlugin.zip'
+
+  // Download and Extract CLI (ZIP file)
+  sh """
+    curl -o ${zipFileName} ${cliURL}
+    mkdir -p ${destinationDirectory}
+  """
+  // unzipping the zipped file
+  unzip dir: destinationDirectory, zipFile: zipFileName
+  //removing the zip file  and changing permissions. 
+  sh """
+    rm -f ${zipFileName}
+    chmod 775 ${destinationDirectory}/*.sh
+  """
+
+  return destinationDirectory
+}
+
+/** 
+ * Returns the associated CheckMarx project type based on a branch name.
+ * 
+ * @author RetirementDevOps@company.com
+ * @param branchName (Optional) branch name associated with the code that will be scanned. Defaults to 'develop'
+ * @return projectType the checkMarx project type given the branch. Potential values would be 'dev', 'prod' or 'feature'
+ * @example <pre> {@code
+ *   checkmarx.getProjectType()
+ * }</pre>
+ */
+String getProjectType(Map params = [:]) {
+  String branchName = enaParams.optional(value: params.branchName, class: String.class, default: 'develop')
+  String projectType = 'dev'
+
+  if (branchName =~ /^(release)/) {
+    projectType = 'prod'
+  } else if (branchName =~ /^(hotfix)/) {
+    projectType = 'feature'
+  } else if (branchName =~ /^(bugfix)/) {
+    projectType = 'feature'
+  } else if (branchName =~ /^(feature)/) {
+    projectType = 'feature'
+  } else if (branchName =~ /^(PR)/) {
+    projectType = ''
+  } else if (branchName == 'develop') {
+    projectType = 'dev'
+  } else if (branchName == 'master') {
+    projectType = 'prod'
+  } else {
+    projectType = ''
+  }
+
+  return projectType
+}
+--------------------------------------------------------cxone.groovy-----------------
+String scan(Map params = [:]) {
+  enaLogger.debug(msg: "Parameter project passed in value: ${params.project}")
+  String projectName = enaParams.required(name: 'project', value: params.project, class: String.class)
+
+  enaLogger.debug(msg: "Parameter projectTags passed in value: ${params.projectTags}")
+  String projectTags = enaParams.required(name: 'projectTags', value: params.projectTags, class: String.class)
+
+  enaLogger.debug(msg: "Parameter tags passed in value: ${params.tags}")
+  String tags = enaParams.required(name: 'tags', value: params.tags, class: String.class)
+
+  enaLogger.debug(msg: "Parameter projectType passed in value: ${params.projectType}")
+  String projectType = enaParams.required(name: 'projectType', value: params.projectType, class: String.class)
+
+  enaLogger.debug(msg: "Parameter projectGroup passed in value: ${params.projectGroup}")
+  String projectGroup = enaParams.required(name: 'projectGroup', value: params.projectGroup, class: String.class)
+
+  enaLogger.debug(msg: "Parameter credentialsId passed in value: ${params.credentialsId}")
+  String credentialsId = enaParams.optional(value: params.credentialsId, class: String.class, default: 'cxone-cid-secret')
+
+  enaLogger.debug(msg: "Parameter sourcePath passed in value: ${params.sourcePath}")
+  String sourcePath = enaParams.optional(value: params.sourcePath, class: String.class, default: 'source')
+
+  enaLogger.debug(msg: "Parameter default Group passed in value: ${params.defaultGroup}")
+  String defaultGroup = enaParams.optional(value: params.defaultGroup, class: String.class, default: 'CxOne_Default_Group')
+
+  enaLogger.debug(msg: "Parameter cxoneURL passed in value: ${params.cxoneURL}")
+  String cxoneURL = enaParams.optional(value: params.cxoneURL, class: String.class, default: 'https://cxone.cloud')
+
+  echo "Starting Checkmarx SCA scan using plugin..."
+  echo "Deleting CheckMarxPlugin leftover from Checkmarx scan"
+  sh """
+      pwd
+      rm -rf CheckMarxPlugin
+    """
+  checkmarxASTScanner(
+    additionalOptions: """--scan-types sca --project-groups ${projectGroup},"${defaultGroup}" --base-uri "${cxoneURL}" --sca-resolver-params "-d -e !*.dll,!*.exe,!*.pdb,!**/bin/**/*,!**/obj/**/*,!*Tests.csproj,!*Tests.sln,!**/*Tests/**/*" --tags "${tags}" --report-format json,summaryHTML,SBOM --output-name cx_result_sca --threshold sca-high=200;sca-medium=200 --wait-delay 60 --sca-exploitable-path false --sca-last-sast-scan-time 1""",
+    branchName: "${projectType}",
+    checkmarxInstallation: 'CxASTCLI',
+    credentialsId: "${credentialsId}",
+    projectName: "${projectName}",
+    serverUrl: "${cxoneURL}",
+    tenantName: 'company',
+    useOwnAdditionalOptions: true,
+    useOwnServerCredentials: true
+  )
+
+  // Extract Scan ID from build logs
+  def cxone_scanId = ''
+  def logLines = currentBuild.rawBuild.getLog(100000) // keep your limit
+
+  for (line in logLines) {
+    def matcher = (line =~ /\bScan ID\s*:\s*([0-9a-fA-F-]{36})\b/)
+    if (matcher.find()) {
+      cxone_scanId = matcher.group(1)
+      echo "Extracted Scan ID: ${cxone_scanId}"
+      break
+    }
+  }
+  return cxone_scanId ?: "Scan triggered for project: ${projectName}, but Scan ID not found."
+}
+
+String getProjectType(Map params = [:]) {
+  String branchName = enaParams.optional(value: params.branchName, class: String.class, default: 'develop')
+  String projectType = 'develop'
+
+  if (branchName =~ /^(release)/) {
+    projectType = 'release'
+  } else if (branchName =~ /^(hotfix)/) {
+    projectType = 'feature'
+  } else if (branchName =~ /^(bugfix)/) {
+    projectType = 'feature'
+  } else if (branchName =~ /^(feature)/) {
+    projectType = 'feature'
+  } else if (branchName =~ /^(PR)/) {
+    projectType = ''
+  } else if (branchName == 'develop') {
+    projectType = 'develop'
+  } else if (branchName == 'master') {
+    projectType = 'prod'
+  } else {
+    projectType = ''
+  }
+
+  return projectType
+}
+--------------------------------------------
+
+
+
+
+
