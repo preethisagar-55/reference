@@ -2037,3 +2037,139 @@ else
   echo "No lock file found at: $lockFilePath"
 fi
 ------------------------------
+this is for db migration flyway bash script for reference
+
+
+----------------------------ret db pull maj version------------------
+
+repoName='<+stage.variables.repoName>'
+appName='<+stage.variables.appName>'  
+snapshotOrRelease='<+stage.variables.snapshotOrRelease>'
+artifactoryUser='<+stage.variables.artifactoryUser>'
+artifactoryPass='<+stage.variables.artifactoryPass>'
+majorVersion='<+stage.variables.majorVersion>'
+
+echo "selection value is : $snapshotOrRelease"
+lowerRepoName=$(echo "$repoName" | tr '[:upper:]' '[:lower:]')    
+
+IFS='.' read -ra array <<< "$majorVersion"
+versionCount=${#array[@]}
+
+    if [[ "$lowerRepoName" == *"snapshot-local"* ]]; then
+    snapshotOrRelease="SNAPSHOT"
+    elif [[ "$lowerRepoName" == *"release-local"* ]]; then
+    snapshotOrRelease="RELEASE"
+    fi
+
+
+if [[ $snapshotOrRelease == "SNAPSHOT" ]]; then
+    # Download the HTML content and save it to the variable 'files'
+    html_content=$(curl -u $artifactoryUser:$artifactoryPass -s -X GET  "$repoName")
+    echo "Here is the html: $html_content"
+    
+    # Extract snapshot versions from HTML content
+    versions=$(echo "$html_content" | grep -oP '(?<=<a href=")[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-SNAPSHOT/' | sed 's|/||g')
+    # Sort versions and get the latest one
+    latest_version=$(echo "$versions" | sort -V | tail -n 1)
+
+    majorVersion="${latest_version%-SNAPSHOT}"
+    echo "final minor version is $majorVersion"
+    echo "majorVersion"
+
+    # Download the HTML content and save it to the variable 'files'
+    response=$(curl -u $artifactoryUser:$artifactoryPass -s -X GET  "$repoName"/"$majorVersion"-SNAPSHOT/)
+
+    files=$(echo "$response"| grep -oP '(?<=href=")[^"]+\.jar')
+    echo "Files found: $files"
+
+    # Filter .jar files, sort them by the timestamp in the filename, and select the latest one
+    latest_jar=$(echo "$files" | sort -t- -k5 -r | head -n 1)
+
+    # Remove the prefix and the .jar extension from the latest .jar file and print the remaining name
+    remaining_name=${latest_jar#$appName-snapshot-}
+
+    minorVersion=${remaining_name%.jar}
+    output=$(echo $minorVersion | sed 's/'$appName'-//')
+    outputWithoutMajor=$(echo $output | sed "s/$majorVersion//")
+    timestamp=$(echo $outputWithoutMajor | sed 's/^-//')
+
+elif [[ $snapshotOrRelease == "RELEASE" ]]; then
+    # Download the HTML content and save it to the variable 'files'
+
+    response=$(curl -u $artifactoryUser:$artifactoryPass -s -X GET  "$repoName"/)
+    files=$(echo "$response"| grep -oP '(?<=<a href=")[0-9]+\.[0-9]+\.[0-9]+-[0-9]+/')
+    if [[ "$versionCount" == 3 ]]; then
+        version_files=$(echo "$files" | grep "<+stage.variables.majorVersion>-")
+    else
+        version_files=$(echo "$files" | grep "<+stage.variables.majorVersion>\.")
+    fi
+    if [ -z "$version_files" ]; then
+    echo "Error: No version found with version <+stage.variables.majorVersion>"
+    exit 1
+    fi  
+
+    latest_file=$(echo "$version_files" | sort -V | tail -n 1)
+    echo "Sorted_result:$latest_file"
+
+
+    minorVersion="${latest_file%/}"
+    echo "final minor version is $minorVersion"
+
+    echo "$minorVersion"
+
+else
+    echo "Please select SNAPSHOT OR RELEASE"
+    exit 1
+
+fi 
+
+
+
+------------------------db update notes flyway---------------------------------------
+
+#!/bin/bash
+mkdir /tmp/.m2                       
+
+# Previous stage output variables
+pullVersion='<+pipeline.stages.Pull_Version.spec.execution.steps.Pull_Version_Script.output.outputVariables.mVersion>'
+tStamp='<+pipeline.stages.Pull_Version.spec.execution.steps.Pull_Version_Script.output.outputVariables.tstamp>'
+minorVersion='<+pipeline.stages.Pull_Version.spec.execution.steps.Pull_Version_Script.output.outputVariables.minorVersion>'
+
+repoName='<+pipeline.stages.Pull_Version.variables.repoName>'
+appName='<+pipeline.stages.Pull_Version.variables.appName>'
+snapshotOrRelease='<+pipeline.stages.Pull_Version.variables.snapshotOrRelease>'
+dbUsername='<+stage.variables.dbUsername>'
+dbPwd='<+stage.variables.dbPwd>'
+env='<+stage.variables.env>'
+artifactoryUser='<+pipeline.stages.Pull_Version.variables.artifactoryUser>'
+artifactoryPass='<+pipeline.stages.Pull_Version.variables.artifactoryPass>'
+flyway='<+stage.variables.flyway>'
+
+# cloverURL="https://vlmazclvrdgds1.fidev.local:8443/clover/"
+
+cat << 'EOD' > /tmp/.m2/settings.xml
+<+fileStore.getAsString("/settings/settings.xml")>
+EOD
+ 
+mkdir /harness/"$appName"
+cd /harness/"$appName"
+
+echo "step1: Condition to check and retrive artifact from jfrog"
+#retrieve-artifacts from JForg                        
+if [[ $snapshotOrRelease == "SNAPSHOT" ]]; then
+   curl -u $artifactoryUser:$artifactoryPass -o "$appName-$pullVersion-$tStamp.jar" "$repoName/$pullVersion-SNAPSHOT/$appName-$pullVersion-$tStamp.jar"
+elif [[ $snapshotOrRelease == "RELEASE" ]]; then
+   curl -u $artifactoryUser:$artifactoryPass -o "$appName-$minorVersion.jar" "$repoName/$minorVersion/$appName-$minorVersion.jar"
+fi
+
+echo "step2: unzip and move files to dedicated folder lcoation"
+jar -xf $appName-*.jar
+
+
+mv /harness/$appName/META-INF/maven/com.fi.wra.retirement/$appName/pom.xml /harness/$appName
+
+
+echo "step4: Run maven command"
+mvn -e -V -Poracle -Denv=$env -s /tmp/.m2/settings.xml -Dmaven.repo.local=/tmp/.m2/repository -Dfilter="org.flyway" -Duser=$dbUsername -Dpass=$dbPwd initialize flyway:info flyway:$flyway flyway:info 
+
+echo "flyway execution sucessfull"
