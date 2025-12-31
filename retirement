@@ -818,7 +818,7 @@ void call(String versionNumber, String[] repositoryNames, Date start_time, Map c
                 instance_guid = "d6961b19-fcbb-4f16-8c55-c4b33a010260"
                 instance_name = "ci-cd-instance"
                 echo "instance_name: ${instance_name}"
-                instance_url = "https://jenkins.fis.dev/"
+                instance_url = "https://jenkins.fi.dev/"
                 echo "instance_url: ${instance_url}"
                 job_full_name = "${repoName}"
                 qualified_name = "${repoName}"
@@ -1532,9 +1532,508 @@ String getProjectType(Map params = [:]) {
 
   return projectType
 }
---------------------------------------------
+--------------------------------------------reference notes for moddev cd------------------------------------
+
+template:
+  name: rcore-moddev-adhoc-template
+  identifier: moddev
+  versionLabel: "1"
+  type: Pipeline
+  orgIdentifier: Retirement_Next_Gen
+  tags:
+    deploy.ksh: ""
+  spec:
+    stages:
+      - stage:
+          name: Deploy
+          identifier: Deploy
+          description: ""
+          type: Custom
+          spec:
+            execution:
+              steps:
+                - step:
+                    type: ShellScript
+                    name: Execution
+                    identifier: Executing
+                    spec:
+                      shell: Bash
+                      executionTarget:
+                        host: <+repeat.item>
+                        connectorRef: <+input>
+                        workingDirectory: <+pipeline.variables.workingDir>
+                      delegateSelectors: <+input>
+                      source:
+                        type: Inline
+                        spec:
+                          script:
+                                                    script: "bb_token=\"<+pipeline.variables.bb_token>\"\nbb_branch=\"<+pipeline.variables.bb_branch>\"\nbb_project=\"<+pipeline.variables.bb_project>\"\nbb_repo=\"<+pipeline.variables.bb_repo>\"\nbb_scripts_path=\"<+pipeline.variables.bb_scripts_path>\"\narti_user=\"<+pipeline.variables.arti_user>\"\narti_token=\"<+pipeline.variables.arti_token>\"\ngroupID=\"<+pipeline.variables.arti_groupID>\"\nrepoID=\"<+pipeline.variables.arti_repoID>\"\nartifactID=\"<+pipeline.variables.arti_artifactID>\"\nmajor_version=\"<+pipeline.variables.majorVersion>\"\napp_dir=\"<+pipeline.variables.app_dir>\"\nrelease_type=\"<+pipeline.variables.release_type>\"\ndeploy_script=\"<+pipeline.variables.deploy_script>\"\nenv=\"<+pipeline.variables.Environment>\"\nadditional_scripts=\"<+pipeline.variables.additional_scripts>\"\npipeline_exec_id=\"<+pipeline.sequenceId>\"\nworkingDir=\"<+pipeline.variables.workingDir>\"\ndomain=\"<+pipeline.variables.domain>\"\ndeploy_release=\"<+pipeline.variables.deploy_release>\"\nuser=\"<+pipeline.variables.user>\"\nfileset=\"<+pipeline.variables.fileset>\"\npipelineName=\"<+pipeline.name>\"\nretryCount=0\nmaxRetries=3\nsleepInterval=10\n\nLOCKFILE=\"$workingDir/harness-${env}.lock\"\n\nwhile [ $retryCount -lt $maxRetries ]; do\n    if [ -f \"$LOCKFILE\" ]; then\n        fileContent=$(cat \"$LOCKFILE\")\n        echo \"Warning: Either the pipeline $fileContent build number is already running or harness-${env}.lock file was not deleted properly.\"\n        \n        retryCount=$((retryCount + 1))\n        echo \"Retrying in $sleepInterval seconds... (Attempt $retryCount of $maxRetries)\"\n        sleep $sleepInterval\n    else\n        # Create the lock file\n        touch \"$LOCKFILE\"\n        echo \"$pipelineName :: $pipeline_exec_id\" > \"$LOCKFILE\"\n        echo \"Lock acquired. Starting deployment.\"\n        break\n    fi\ndone\n\nif [ $retryCount -eq $maxRetries ]; then\n    echo \"Error: Maximum retry attempts reached. Exiting, retry after previous execution gets completed or if there is no previous execution remove the stale lock file\"\n    exit 1\nfi\n\n\n\t# Your deployment script starts here\n\n\tcheck_vars() {\n\t  list_of_vars=(\"release_type\" \"env\" \"additional_scripts\" \"domain\")\n\t  for var in \"${list_of_vars[@]}\"; do\n\t\tif [[ ${!var} == \"ChooseOne\" ]]; then\n\t\t  echo \"Error: Incorrect choice for the variable $var\"\n\t\t  do_exit=\"true\"\n\t\tfi\n\t  done\n\t  if [[ \"$do_exit\" == \"true\" ]]; then\n\t\texit 100\n\t  fi\n\t}\n\n\tget_latest_version() {\n\t  url=$1\n\t  curl -s -x \"$PROXY_URL\" -u \"${arti_user}:${arti_token}\" \"$url\" | grep -oP '(?<=<latest>).*?(?=</latest>)'\n\t}\n\n\tget_latest_version_with_build() {\n\t  url=$1\n\t  curl -s -x \"$PROXY_URL\" -u \"${arti_user}:${arti_token}\" \"$url\" | awk -v RS=\"</snapshotVersion>\" '/<extension>tar\\.gz<\\/extension>/{gsub(/.*<value>|<\\/value>.*/, \"\"); print}'\n\t}\n\n\tget_latest_release_version() {\n\t  url=$1\n\t  curl -s -x \"$PROXY_URL\" -u \"${arti_user}:${arti_token}\" \"$url\" | grep -oP '\"version\"\\s*:\\s*\"\\K[^\"]+' | sort -V | tail -n 1\n\t}\n\n\tdownload_file() {\n\t  url=$1\n\t  output_file=$2\n\t  if ! curl -s -x \"$PROXY_URL\" -u \"${arti_user}:${arti_token}\" \"$url\" -o \"$output_file\"; then\n\t\techo \"Error: Failed to download file from $url\"\n\t\tclean_up\n\t\texit 1\n\t  fi\n\t}\n\n\tclean_up() {\n\t  echo \"Cleaning up...\"\n\t  cd \"$workingDir\" || { echo \"Error: Unable to cd to dir $workingDir\"; exit 5; }\n\t  rm -rf \"$pipeline_exec_id\"\n\t}\n\n\tdomain_lower=$(echo \"$domain\" | tr '[:upper:]' '[:lower:]')\n\n\tif [[ \"$domain_lower\" == \"fidev.local\" ]]; then\n\t  export PROXY_URL=\"vlmazsdlproxy.fidev.local:8080\"\n\telif [[ \"$domain_lower\" == \"prod.local\" ]]; then\n\t  export PROXY_URL=\"proxy.prod.local:8080\"\n\telse\n\t  echo \"Error: Unsupported domain $domain_lower\"\n\t  exit 10\n\tfi\n\n\tcheck_vars\n\n\tmkdir -p \"$workingDir/$pipeline_exec_id\" || { echo \"Error: Unable to create directory $pipeline_exec_id\"; exit 4; }\n\tcd \"$workingDir/$pipeline_exec_id\" || { echo \"Error: Unable to cd to dir $pipeline_exec_id\"; exit 5; }\n\trm -rf * || echo \"Warning: Nothing to remove perhaps?\"\n\n\tbb_encoded_branch=$(echo \"${bb_branch}\" | sed 's/\\//%2F/g')\n\tmodified_groupID=$(echo \"${groupID}\" | sed 's/\\./\\//g')\n\n\tif [[ \"$release_type\" == \"snapshot\" ]] && { [[ -z \"$major_version\" ]] || [[ \"$major_version\" =~ ^[Ll][Aa][Tt][Ee][Ss][Tt]$ ]]; }; then\n\t  latest_version=$(get_latest_version \"https://artifactory.fi.dev/artifactory/${repoID}/${modified_groupID}/${artifactID}/maven-metadata.xml\")\n\t  latestVersion_withBuild=$(get_latest_version_with_build \"https://artifactory.fi.dev/artifactory/${repoID}/${modified_groupID}/${artifactID}/${latest_version}/maven-metadata.xml\")\n\t  latest_file=\"${artifactID}-${latestVersion_withBuild}.tar.gz\"\n\t  echo \"INFO: Latest version - $latest_version\"\n\telif [[ \"$release_type\" == \"release\" ]] && [[ \"$major_version\" != ^[Ll][Aa][Tt][Ee][Ss][Tt]$ ]] && [[ -n \"$major_version\" ]]; then\n\t  latest_version=$(get_latest_release_version \"https://artifactory.fi.dev/artifactory/api/search/versions?g=${groupID}&v=${major_version}*&a=${artifactID}&repos=${repoID}\")\n\t  latest_file=\"${artifactID}-${latest_version}.tar.gz\"\n\t  echo \"INFO: Latest version - $latest_version\"\n\telse\n\t  echo \"Error: Invalid release type or incorrect major version.\"\n\t  clean_up\n\t  exit 1\n\tfi\n\n\tarti_url=\"https://artifactory.fi.dev/artifactory/${repoID}/${modified_groupID}/${artifactID}/${latest_version}/${latest_file}\"\n\techo \"INFO: Artifact URL - ${arti_url}\"\n\n\ttypeset -a bb_files\n\ttypeset -a bb_env_files\n\n\tbb_files=(\"$deploy_script\")\n\tbb_env_files=()\n\n\tif [[ \"$additional_scripts\" =~ ^[yY][eE][sS]$ ]]; then\n\t  bb_env_files=(\"deploy-${env}.ksh\")\n\telse\n\t  echo \"INFO: No additional scripts to download.\"\n\tfi\n\n\n\tdownload_and_execute() {\n\t  script=$1\n\t  full_file_url=\"https://bitbucket.fi.dev/projects/${bb_project}/repos/${bb_repo}/raw/${bb_scripts_path}/${script}?at=refs%2Fheads%2F${bb_encoded_branch}\"\n\t  echo \"INFO: Downloading $script\"\n\t  if ! curl -s -x \"$PROXY_URL\" -H \"Authorization: Bearer $bb_token\" \"$full_file_url\" -o \"$script\"; then\n\t\techo \"Error: Failed to download file from $full_file_url.\"\n\t\tclean_up\n\t\texit 1\n\t  fi\n\t  echo \"INFO: $script downloaded.\"\n\t  sleep 120\n\t  ls -l \"$script\"\n\t  chmod 755 \"$script\"\n\t  ksh \"$script\" \"${deploy_release}\" \"${arti_url}\" \"${arti_user}:${arti_token}\" \"${domain}\"\n\t  if [ $? -ne 0 ]; then\n\t\techo \"Error: Script $script failed to execute successfully\"\n\t\tclean_up\n\t\texit 1\n\t  else\n\t\techo \"INFO: Script $script executed successfully\"\n\t  fi\n\t}\n\n\tdownload_and_execute_env() {\n\t  script=$1\n\t  full_file_url=\"https://bitbucket.fi.dev/projects/${bb_project}/repos/${bb_repo}/raw/${bb_scripts_path}/${script}?at=refs%2Fheads%2F${bb_encoded_branch}\"\n\t  echo \"INFO: Downloading $script\"\n\t  if ! curl -s -x \"$PROXY_URL\" -H \"Authorization: Bearer $bb_token\" \"$full_file_url\" -o \"$script\"; then\n\t\techo \"Error: Failed to download file from $full_file_url.\"\n\t\tclean_up\n\t\texit 1\n\t  fi\n\t  echo \"INFO: $script downloaded.\"\n\t  ls -l \"$script\"\n\t  chmod 755 \"$script\"\n\t  ksh \"$script\" \"${deploy_release}\"\n\t  if [ $? -ne 0 ]; then\n\t\techo \"Error: Script $script failed to execute successfully\"\n\t\tclean_up\n\t\texit 1\n\t  else\n\t\techo \"INFO: Script $script executed successfully\"\n\t  fi\n\t}\n\n\tfor script in \"${bb_files[@]}\"; do\n\t  download_and_execute \"$script\"\n\tdone\n\n\tif [[ \"$additional_scripts\" =~ ^[yY][eE][sS]$ && ${#bb_env_files[@]} -gt 0 ]]; then\n\t  echo \"INFO: Additional scripts to download: ${bb_env_files[@]}\"\n\t  for script in \"${bb_env_files[@]}\"; do\n\t\tdownload_and_execute_env \"$script\"\n\t  done\n\telse\n\t  echo \"INFO: No additional scripts to download.\"\n\tfi\n\n\tclean_up\n\texit 0"
 
 
+                      environmentVariables: []
+                      outputVariables: []
+                    timeout: <+input>
+                    strategy:
+                      repeat:
+                        items: <+<+pipeline.variables.hosts>.split(',')>
+                        nodeName: on_<+repeat.item>
+                - step:
+                    type: ShellScript
+                    name: remove-lock-file
+                    identifier: removelockfile
+                    spec:
+                      shell: Bash
+                      executionTarget:
+                        host: <+repeat.item>
+                        connectorRef: <+input>
+                        workingDirectory: <+pipeline.variables.workingDir>
+                      delegateSelectors: <+input>
+                      source:
+                        type: Inline
+                        spec:
+                          script: |-
+                            pipelineName="<+pipeline.name>"
+                            env="<+pipeline.variables.Environment>"
+                            pipeline_exec_id="<+pipeline.sequenceId>"
+                            directoryPath="<+pipeline.variables.workingDir>"
+                            lockFilePath="$directoryPath/harness-${env}.lock"
+                            echo "$lockFilePath"
+                            pwd
+                            ls -ltr
+
+                            # Check if the lock file exists and remove it if found
+                            if [ -f "$lockFilePath" ]; then
+                              fileContent=$(cat "$lockFilePath")
+                              if [[ "$fileContent" =~ "$pipelineName :: $pipeline_exec_id" ]]; then
+                                echo "The lock file contains this pipeline name and pipeline execution id."
+                                rm -f "$lockFilePath"
+                                echo "Lock file removed: $lockFilePath"
+                              else
+                                echo "The lock file does not contain this pipeline name and build number."
+                                echo "Check the pipeline $fileContent build"
+                                echo "If the pipeline does not exist, remove the lock file manually. Contact the Automation testing team."
+                                exit 1
+                              fi
+                            else
+                              echo "No lock file found at: $lockFilePath"
+                            fi
+                      environmentVariables: []
+                      outputVariables: []
+                    timeout: 10m
+                    strategy:
+                      repeat:
+                        items: <+<+pipeline.variables.hosts>.split(',')>
+                        nodeName: on_<+repeat.item>
+                    when:
+                      stageStatus: All
+          tags: {}
+      - stage:
+          name: Jenkins CI Information
+          identifier: Jenkins_CI_Information
+          description: ""
+          type: Custom
+          spec:
+            execution:
+              steps:
+                - step:
+                    type: ShellScript
+                    name: ShellScript_1
+                    identifier: ShellScript_1
+                    spec:
+                      shell: Bash
+                      executionTarget: {}
+                      source:
+                        type: Inline
+                        spec:
+                          script: |-
+                            echo "bbcommit id is $bbcommit"
+                            echo "jenkinsurl is $jenkinsurl"
+                            echo "chartVersion is $chartVersion"
+                      environmentVariables:
+                        - name: bbcommit
+                          type: String
+                          value: <+pipeline.variables.bbcommit>
+                        - name: jenkinsurl
+                          type: String
+                          value: <+pipeline.variables.jenkinsurl>
+                        - name: chartVersion
+                          type: String
+                          value: <+pipeline.variables.chartVersion>
+                      outputVariables: []
+                    timeout: 10m
+          tags: {}
+          when:
+            pipelineStatus: Success
+            condition: <+pipeline.triggeredBy.triggerIdentifier>=="moddevtrigger"
+    variables:
+      - name: bb_token
+        type: Secret
+        description: Bitbucket API token
+        required: true
+        value: <+input>
+      - name: bb_branch
+        type: String
+        description: Bitbucket branch to download scripts from.
+        required: true
+        value: <+input>
+      - name: bb_project
+        type: String
+        description: Bitbucket project
+        required: true
+        value: <+input>
+      - name: bb_repo
+        type: String
+        description: Bitbucket repo
+        required: true
+        value: <+input>
+      - name: bb_scripts_path
+        type: String
+        description: |-
+          Path where the deploy scripts are placed.
+          Example: jenkins/deployment
+        required: true
+        value: <+input>
+      - name: arti_user
+        type: String
+        description: Artifactory User
+        required: true
+        value: <+input>
+      - name: arti_token
+        type: Secret
+        description: Artifactory token
+        required: true
+        value: <+input>
+      - name: arti_groupID
+        type: String
+        description: "Artifactory Group ID. Example: com.fi.wra.retirement"
+        required: false
+        value: <+input>
+      - name: arti_repoID
+        type: String
+        description: |-
+          You guessed it right! Artifactory Repo ID.
+          Examples: rcore-maven-release-local or rcore-maven-snapshot-local
+        required: false
+        value: <+input>
+      - name: arti_artifactID
+        type: String
+        description: "Artifactory Artifact ID. Example: retirement-core-moddev"
+        required: true
+        value: <+input>
+      - name: release_type
+        type: String
+        description: snapshot or release ?
+        required: true
+        value: <+input>.default(ChooseOne).allowedValues(ChooseOne,snapshot,release)
+      - name: majorVersion
+        type: String
+        description: Enter the Major Version number if the releas_type is "release"
+        required: false
+        value: <+input>
+      - name: app_dir
+        type: String
+        description: Application directory in the server where scripts have to placed or artifacts have to be extracted.
+        required: true
+        value: <+input>
+      - name: deploy_script
+        type: String
+        description: The main deployment script, that is deploy.ksh mostly.
+        required: true
+        value: <+input>
+      - name: Environment
+        type: String
+        description: Environment where this has to be deployed to.
+        required: true
+        value: <+input>.default(ChooseOne).allowedValues(ChooseOne,demo,dev,devcore,devgds,devint,qa,perf)
+      - name: additional_scripts
+        type: String
+        description: Is there any environment-specific script to be executed?
+        required: true
+        value: <+input>.default(ChooseOne).allowedValues(Yes,No,ChooseOne)
+      - name: workingDir
+        type: String
+        description: Temporary workspace directory for harness.
+        required: false
+        value: <+input>
+      - name: hosts
+        type: String
+        description: "Select one or more same domain hosts to execute simultaneously. "
+        required: true
+        value: <+input>
+      - name: domain
+        type: String
+        description: Domain of the selected host(s).
+        required: true
+        value: <+input>.default(ChooseOne).allowedValues(ChooseOne,fidev.local,prod.local)
+      - name: deploy_release
+        type: String
+        description: Typically, moddev.
+        required: true
+        value: <+input>
+      - name: fileset
+        type: String
+        description: Fileset to run with.
+        required: false
+        value: <+input>
+      - name: user
+        type: String
+        description: User to run the batch process as.
+        required: false
+        value: <+input>
+      - name: bbcommit
+        type: String
+        description: ""
+        required: false
+        value: <+trigger.payload.bbcommit>
+      - name: jenkinsurl
+        type: String
+        description: ""
+        required: false
+        value: <+trigger.payload.jenkinsurl>
+      - name: chartVersion
+        type: String
+        description: ""
+        required: false
+        value: <+trigger.payload.chartVersion>
+  description: This is moddev template used for omnicode depoyments.
+
+--------------------moddev bash---------------------------
+
+bb_token="<+pipeline.variables.bb_token>"
+bb_branch="<+pipeline.variables.bb_branch>"
+bb_project="<+pipeline.variables.bb_project>"
+bb_repo="<+pipeline.variables.bb_repo>"
+bb_scripts_path="<+pipeline.variables.bb_scripts_path>"
+arti_user="<+pipeline.variables.arti_user>"
+arti_token="<+pipeline.variables.arti_token>"
+groupID="<+pipeline.variables.arti_groupID>"
+repoID="<+pipeline.variables.arti_repoID>"
+artifactID="<+pipeline.variables.arti_artifactID>"
+major_version="<+pipeline.variables.majorVersion>"
+app_dir="<+pipeline.variables.app_dir>"
+release_type="<+pipeline.variables.release_type>"
+deploy_script="<+pipeline.variables.deploy_script>"
+env="<+pipeline.variables.Environment>"
+additional_scripts="<+pipeline.variables.additional_scripts>"
+pipeline_exec_id="<+pipeline.sequenceId>"
+workingDir="<+pipeline.variables.workingDir>"
+domain="<+pipeline.variables.domain>"
+deploy_release="<+pipeline.variables.deploy_release>"
+user="<+pipeline.variables.user>"
+fileset="<+pipeline.variables.fileset>"
+pipelineName="<+pipeline.name>"
+retryCount=0
+maxRetries=3
+sleepInterval=10
+
+LOCKFILE="$workingDir/harness-${env}.lock"
+
+while [ $retryCount -lt $maxRetries ]; do
+    if [ -f "$LOCKFILE" ]; then
+        fileContent=$(cat "$LOCKFILE")
+        echo "Warning: Either the pipeline $fileContent build number is already running or harness-${env}.lock file was not deleted properly."
+        
+        retryCount=$((retryCount + 1))
+        echo "Retrying in $sleepInterval seconds... (Attempt $retryCount of $maxRetries)"
+        sleep $sleepInterval
+    else
+        # Create the lock file
+        touch "$LOCKFILE"
+        echo "$pipelineName :: $pipeline_exec_id" > "$LOCKFILE"
+        echo "Lock acquired. Starting deployment."
+        break
+    fi
+done
+
+if [ $retryCount -eq $maxRetries ]; then
+    echo "Error: Maximum retry attempts reached. Exiting, retry after previous execution gets completed or if there is no previous execution remove the stale lock file"
+    exit 1
+fi
 
 
+	# Your deployment script starts here
 
+	check_vars() {
+	  list_of_vars=("release_type" "env" "additional_scripts" "domain")
+	  for var in "${list_of_vars[@]}"; do
+		if [[ ${!var} == "ChooseOne" ]]; then
+		  echo "Error: Incorrect choice for the variable $var"
+		  do_exit="true"
+		fi
+	  done
+	  if [[ "$do_exit" == "true" ]]; then
+		exit 100
+	  fi
+	}
+
+	get_latest_version() {
+	  url=$1
+	  curl -s -x "$PROXY_URL" -u "${arti_user}:${arti_token}" "$url" | grep -oP '(?<=<latest>).*?(?=</latest>)'
+	}
+
+	get_latest_version_with_build() {
+	  url=$1
+	  curl -s -x "$PROXY_URL" -u "${arti_user}:${arti_token}" "$url" | awk -v RS="</snapshotVersion>" '/<extension>tar\.gz<\/extension>/{gsub(/.*<value>|<\/value>.*/, ""); print}'
+	}
+
+	get_latest_release_version() {
+	  url=$1
+	  curl -s -x "$PROXY_URL" -u "${arti_user}:${arti_token}" "$url" | grep -oP '"version"\s*:\s*"\K[^"]+' | sort -V | tail -n 1
+	}
+
+	download_file() {
+	  url=$1
+	  output_file=$2
+	  if ! curl -s -x "$PROXY_URL" -u "${arti_user}:${arti_token}" "$url" -o "$output_file"; then
+		echo "Error: Failed to download file from $url"
+		clean_up
+		exit 1
+	  fi
+	}
+
+	clean_up() {
+	  echo "Cleaning up..."
+	  cd "$workingDir" || { echo "Error: Unable to cd to dir $workingDir"; exit 5; }
+	  rm -rf "$pipeline_exec_id"
+	}
+
+	domain_lower=$(echo "$domain" | tr '[:upper:]' '[:lower:]')
+
+	if [[ "$domain_lower" == "fidev.local" ]]; then
+	  export PROXY_URL="vlmazsdlproxy.fidev.local:8080"
+	elif [[ "$domain_lower" == "prod.local" ]]; then
+	  export PROXY_URL="proxy.prod.local:8080"
+	else
+	  echo "Error: Unsupported domain $domain_lower"
+	  exit 10
+	fi
+
+	check_vars
+
+	mkdir -p "$workingDir/$pipeline_exec_id" || { echo "Error: Unable to create directory $pipeline_exec_id"; exit 4; }
+	cd "$workingDir/$pipeline_exec_id" || { echo "Error: Unable to cd to dir $pipeline_exec_id"; exit 5; }
+	rm -rf * || echo "Warning: Nothing to remove perhaps?"
+
+	bb_encoded_branch=$(echo "${bb_branch}" | sed 's/\//%2F/g')
+	modified_groupID=$(echo "${groupID}" | sed 's/\./\//g')
+
+	if [[ "$release_type" == "snapshot" ]] && { [[ -z "$major_version" ]] || [[ "$major_version" =~ ^[Ll][Aa][Tt][Ee][Ss][Tt]$ ]]; }; then
+	  latest_version=$(get_latest_version "https://artifactory.fi.dev/artifactory/${repoID}/${modified_groupID}/${artifactID}/maven-metadata.xml")
+	  latestVersion_withBuild=$(get_latest_version_with_build "https://artifactory.fi.dev/artifactory/${repoID}/${modified_groupID}/${artifactID}/${latest_version}/maven-metadata.xml")
+	  latest_file="${artifactID}-${latestVersion_withBuild}.tar.gz"
+	  echo "INFO: Latest version - $latest_version"
+	elif [[ "$release_type" == "release" ]] && [[ "$major_version" != ^[Ll][Aa][Tt][Ee][Ss][Tt]$ ]] && [[ -n "$major_version" ]]; then
+	  latest_version=$(get_latest_release_version "https://artifactory.fi.dev/artifactory/api/search/versions?g=${groupID}&v=${major_version}*&a=${artifactID}&repos=${repoID}")
+	  latest_file="${artifactID}-${latest_version}.tar.gz"
+	  echo "INFO: Latest version - $latest_version"
+	else
+	  echo "Error: Invalid release type or incorrect major version."
+	  clean_up
+	  exit 1
+	fi
+
+	arti_url="https://artifactory.fi.dev/artifactory/${repoID}/${modified_groupID}/${artifactID}/${latest_version}/${latest_file}"
+	echo "INFO: Artifact URL - ${arti_url}"
+
+	typeset -a bb_files
+	typeset -a bb_env_files
+
+	bb_files=("$deploy_script")
+	bb_env_files=()
+
+	if [[ "$additional_scripts" =~ ^[yY][eE][sS]$ ]]; then
+	  bb_env_files=("deploy-${env}.ksh")
+	else
+	  echo "INFO: No additional scripts to download."
+	fi
+
+
+	download_and_execute() {
+	  script=$1
+	  full_file_url="https://bitbucket.fi.dev/projects/${bb_project}/repos/${bb_repo}/raw/${bb_scripts_path}/${script}?at=refs%2Fheads%2F${bb_encoded_branch}"
+	  echo "INFO: Downloading $script"
+	  if ! curl -s -x "$PROXY_URL" -H "Authorization: Bearer $bb_token" "$full_file_url" -o "$script"; then
+		echo "Error: Failed to download file from $full_file_url."
+		clean_up
+		exit 1
+	  fi
+	  echo "INFO: $script downloaded."
+	  sleep 120
+	  ls -l "$script"
+	  chmod 755 "$script"
+	  ksh "$script" "${deploy_release}" "${arti_url}" "${arti_user}:${arti_token}" "${domain}"
+	  if [ $? -ne 0 ]; then
+		echo "Error: Script $script failed to execute successfully"
+		clean_up
+		exit 1
+	  else
+		echo "INFO: Script $script executed successfully"
+	  fi
+	}
+
+	download_and_execute_env() {
+	  script=$1
+	  full_file_url="https://bitbucket.fi.dev/projects/${bb_project}/repos/${bb_repo}/raw/${bb_scripts_path}/${script}?at=refs%2Fheads%2F${bb_encoded_branch}"
+	  echo "INFO: Downloading $script"
+	  if ! curl -s -x "$PROXY_URL" -H "Authorization: Bearer $bb_token" "$full_file_url" -o "$script"; then
+		echo "Error: Failed to download file from $full_file_url."
+		clean_up
+		exit 1
+	  fi
+	  echo "INFO: $script downloaded."
+	  ls -l "$script"
+	  chmod 755 "$script"
+	  ksh "$script" "${deploy_release}"
+	  if [ $? -ne 0 ]; then
+		echo "Error: Script $script failed to execute successfully"
+		clean_up
+		exit 1
+	  else
+		echo "INFO: Script $script executed successfully"
+	  fi
+	}
+
+	for script in "${bb_files[@]}"; do
+	  download_and_execute "$script"
+	done
+
+	if [[ "$additional_scripts" =~ ^[yY][eE][sS]$ && ${#bb_env_files[@]} -gt 0 ]]; then
+	  echo "INFO: Additional scripts to download: ${bb_env_files[@]}"
+	  for script in "${bb_env_files[@]}"; do
+		download_and_execute_env "$script"
+	  done
+	else
+	  echo "INFO: No additional scripts to download."
+	fi
+
+	clean_up
+	exit 0
+
+-------------------------lock---------------------------
+
+pipelineName="<+pipeline.name>"
+env="<+pipeline.variables.Environment>"
+pipeline_exec_id="<+pipeline.sequenceId>"
+directoryPath="<+pipeline.variables.workingDir>"
+lockFilePath="$directoryPath/harness-${env}.lock"
+echo "$lockFilePath"
+pwd
+ls -ltr
+
+# Check if the lock file exists and remove it if found
+if [ -f "$lockFilePath" ]; then
+  fileContent=$(cat "$lockFilePath")
+  if [[ "$fileContent" =~ "$pipelineName :: $pipeline_exec_id" ]]; then
+    echo "The lock file contains this pipeline name and pipeline execution id."
+    rm -f "$lockFilePath"
+    echo "Lock file removed: $lockFilePath"
+  else
+    echo "The lock file does not contain this pipeline name and build number."
+    echo "Check the pipeline $fileContent build"
+    echo "If the pipeline does not exist, remove the lock file manually. Contact the Automation testing team."
+    exit 1
+  fi
+else
+  echo "No lock file found at: $lockFilePath"
+fi
+------------------------------
